@@ -230,30 +230,58 @@ evicted to reclaim memory.
 This makes a spent outpoint visible for exactly the node's chosen depth window, then gone —
 "spent → pruned at a set (by server) depth", not open for all time.
 
-### 11.2 What this bounds
+### 11.2 Correctness floor — _D_ ≥ the node's reorg horizon (MUST be named, not implicit)
+
+Pruning at depth _D_ **embeds an assumption**: `D ≥ the maximum reorg depth the node will
+tolerate`. A reorg **deeper than _D_** rolls back a spend whose record has **already been
+discarded** — after that the node **answers wrong**: it reports an unspent status it can no
+longer reconstruct. So _D_ is **not purely a memory/recency knob — it has a correctness
+floor equal to the node's reorg horizon.** Left unstated, that is a hidden defect.
+
+Therefore, as an explicit, advertised **policy field**:
+
+- `D = ReorgHorizon + RecencyWindow`, where **`ReorgHorizon` is the correctness floor** —
+  the deepest reorg the node commits to surviving — and `RecencyWindow ≥ 0` is the extra
+  spent-query window on top.
+- The node **commits to and advertises `D` (and its `ReorgHorizon`)**. It must never prune
+  inside the reorg horizon. (BSV reorgs are typically shallow, but the floor is whatever
+  depth the node commits to surviving, and it is named, not assumed.)
+- Setting `D` below the realized reorg depth is the **only** way pruning can cause a wrong
+  answer; naming the floor makes that a deliberate, refused configuration rather than a
+  silent bug.
+
+### 11.3 What this bounds (feasibility)
 
 Steady-state memory ≈ **live (unspent) UTXO set** + **spends within the last _D_ blocks** +
 **header chain** + **TxIndex within its retention**. Without pruning, spent history would
 accumulate forever; with it, the spent-record footprint is capped at roughly _D_ blocks of
 churn regardless of how long the node runs.
 
-### 11.3 How it runs (driven by new blocks, exact by height)
+**This closes the UTXO-table feasibility item:** steady-state UTXO memory becomes
+`[current unspent set] + [D-block trailing spend buffer]` — **bounded and feasible** —
+instead of unbounded spend history. Note: **`TxIndex` and the proof/subtree store are
+untouched by this** and still grow with chain history; they need the §9 (retention/tiering)
+decision **unless we also prune them** on their own depth/retention policy (§11.6).
 
-- Pruning is **height-driven**, triggered each time ingest advances the tip `H`: a sweep
-  evicts every spent record with `H − spentHeight + 1 > D`. Because the UTXO set is stored
-  **ordered**, and we can index spends by `spentHeight`, the sweep is a contiguous range
-  scan of "spends that just crossed the depth cutoff" — cheap and incremental (only the
-  newly-expired band each block, not a full scan).
-- **Aerospike TTL** can serve as a convenient backstop: on marking an output spent, set a
-  record expiration ≈ `D × ~10 min`. TTL is *time*-based (approximate), so the
-  height-driven sweep is the **authoritative**, exact-by-depth mechanism; TTL is optional
-  belt-and-braces to guarantee eventual reclaim.
-- **Reorgs:** if a block is reorged out, `spentHeight` is re-evaluated on the new chain
-  before eviction — pruning acts only on spends confirmed deeper than _D_, which (with _D_
-  beyond plausible reorg depth) are effectively final. Choosing _D_ ≥ the node's reorg
-  assumption keeps pruning safe.
+### 11.4 Mechanism — prune on block depth, NEVER wall-clock
 
-### 11.4 Query semantics after pruning (honest, SPV-consistent)
+- **Height-driven incremental sweep (the only authoritative mechanism).** On **each new
+  sealed block** advancing the tip to `H`, delete the spent UTXOs whose **`spentHeight =
+  H − D`** — the single band that has just reached depth `D + 1`. (Equivalent to evicting
+  all `spentHeight ≤ H − D`; doing it per block touches only the newly-expired band, so it
+  is O(band), not a full scan — the store is ordered/indexed by `spentHeight`.)
+- **No time-based TTL for depth.** Block intervals vary, so a wall-clock Aerospike TTL is a
+  **wrong proxy** for "D blocks deep" and is **not** used to decide pruning. (At most it
+  could act as a coarse last-resort memory safety valve — never as the depth criterion.)
+- **`D = 0` is the degenerate case:** a strict UTXO set — delete a UTXO the moment it is
+  spent, with **no** reorg/recency buffer (only valid if `ReorgHorizon = 0`). **`D > 0`**
+  keeps a `D`-block trailing reorg/recency window. The default and the floor are policy
+  choices to fix per §11.2.
+- **Reorg handling.** Within the retained `D`-block window a reorged-out spend is rolled
+  back correctly (its record is still present, so the output reverts to unspent on the new
+  chain) — which is exactly *why* `D` must cover the reorg horizon (§11.2).
+
+### 11.5 Query semantics after pruning (honest, SPV-consistent)
 
 - A query for a pruned (long-spent) outpoint returns **"not in retained window"**, *not*
   "unspent" and *not* a false "doesn't exist" — the node states it only serves spends to
@@ -262,17 +290,20 @@ churn regardless of how long the node runs.
   where the client ultimately verifies against the PoW chain.
 - The node **advertises its _D_** so callers know its retention depth.
 
-### 11.5 Decisions (resolved)
+### 11.6 Decisions (resolved)
 
 - **Pruning is in scope now; archival is a separate, later project.** Pruned (deep-spent)
   data is simply **freed**. Keeping/archiving pruned history is **out of scope here** — a
   separate **off-disk** project to be built **after this is finished** (noted for later, on
   close of this work).
 - **Scope:** prune spent UTXO records by spend depth (the stated case); `TxIndex`
-  Seen/Mined retention is **configurable** on its own policy.
-- **_D_ is configurable** per server (and per shard if desired), with a reorg-safe minimum;
-  `D = ∞` (archival) is *not* a goal here — that's the separate archive project.
-- **Mechanism:** height-driven sweep (authoritative) + optional Aerospike TTL backstop.
+  Seen/Mined retention is **configurable** on its own policy (still needs §9 if not pruned).
+- **_D_ is configurable** per server (and per shard if desired), expressed as
+  `D = ReorgHorizon (correctness floor, named & advertised) + RecencyWindow`; the node never
+  prunes inside `ReorgHorizon`. `D = ∞` (archival) is *not* a goal here — that's the
+  separate archive project. `D = 0` is allowed only when `ReorgHorizon = 0`.
+- **Mechanism:** **height-driven incremental sweep on each sealed block** (the only
+  authoritative pruning trigger). **No wall-clock TTL as a depth proxy.**
 
 > **NOTE FOR LATER (archive project):** after this system is finished and closed, build a
 > separate **off-disk archive** that captures pruned (deep-spent) history before/at
