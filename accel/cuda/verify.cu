@@ -346,28 +346,61 @@ __global__ void verify_kernel(const u8 *pub, const u8 *hash, const u8 *sig, u8 *
     res[i] = (u8)verify_one(pub + i * 33, hash + i * 32, sig + i * 64);
 }
 
+// MAX_GPUS caps the multi-GPU fan-out (e.g. a 3-card box).
+#define MAX_GPUS 16
+
+// memserve_secp256k1_verify_batch verifies n signatures, splitting the batch evenly
+// across ALL visible GPUs (cudaGetDeviceCount) so a multi-card box (e.g. 3 NVIDIA cards)
+// is fully utilized. Each device gets a contiguous slice; H2D copies + kernel launches
+// are issued on every device first, then synchronized and copied back — overlapping work
+// across cards. Returns the first CUDA error, 0 on success.
 extern "C" int memserve_secp256k1_verify_batch(
     const unsigned char *pub33, const unsigned char *hash32,
     const unsigned char *sig64, unsigned char *results, int n) {
     if (n <= 0) return 0;
-    u8 *dPub = 0, *dHash = 0, *dSig = 0, *dRes = 0;
-    cudaError_t e;
-    if ((e = cudaMalloc(&dPub, (size_t)n * 33)) != cudaSuccess) return (int)e;
-    if ((e = cudaMalloc(&dHash, (size_t)n * 32)) != cudaSuccess) { cudaFree(dPub); return (int)e; }
-    if ((e = cudaMalloc(&dSig, (size_t)n * 64)) != cudaSuccess) { cudaFree(dPub); cudaFree(dHash); return (int)e; }
-    if ((e = cudaMalloc(&dRes, (size_t)n)) != cudaSuccess) { cudaFree(dPub); cudaFree(dHash); cudaFree(dSig); return (int)e; }
 
-    cudaMemcpy(dPub, pub33, (size_t)n * 33, cudaMemcpyHostToDevice);
-    cudaMemcpy(dHash, hash32, (size_t)n * 32, cudaMemcpyHostToDevice);
-    cudaMemcpy(dSig, sig64, (size_t)n * 64, cudaMemcpyHostToDevice);
+    int ndev = 0;
+    cudaError_t e = cudaGetDeviceCount(&ndev);
+    if (e != cudaSuccess || ndev <= 0) return (int)(e ? e : cudaErrorNoDevice);
+    if (ndev > MAX_GPUS) ndev = MAX_GPUS;
 
-    int threads = 128;
-    int blocks = (n + threads - 1) / threads;
-    verify_kernel<<<blocks, threads>>>(dPub, dHash, dSig, dRes, n);
-    e = cudaDeviceSynchronize();
-    if (e == cudaSuccess)
-        cudaMemcpy(results, dRes, (size_t)n, cudaMemcpyDeviceToHost);
+    u8 *dPub[MAX_GPUS] = {0}, *dHash[MAX_GPUS] = {0}, *dSig[MAX_GPUS] = {0}, *dRes[MAX_GPUS] = {0};
+    int off[MAX_GPUS], cnt[MAX_GPUS];
+    int per = (n + ndev - 1) / ndev;
+    int rc = 0;
 
-    cudaFree(dPub); cudaFree(dHash); cudaFree(dSig); cudaFree(dRes);
-    return (int)e;
+    // Phase 1: per-device allocate, copy in, launch (async across devices).
+    for (int d = 0; d < ndev; d++) {
+        off[d] = d * per;
+        cnt[d] = per;
+        if (off[d] >= n) { cnt[d] = 0; continue; }
+        if (off[d] + cnt[d] > n) cnt[d] = n - off[d];
+        int c = cnt[d];
+        if (cudaSetDevice(d) != cudaSuccess) { rc = (int)cudaErrorInvalidDevice; continue; }
+        if (cudaMalloc(&dPub[d], (size_t)c * 33) != cudaSuccess ||
+            cudaMalloc(&dHash[d], (size_t)c * 32) != cudaSuccess ||
+            cudaMalloc(&dSig[d], (size_t)c * 64) != cudaSuccess ||
+            cudaMalloc(&dRes[d], (size_t)c) != cudaSuccess) {
+            rc = (int)cudaErrorMemoryAllocation;
+            continue;
+        }
+        cudaMemcpyAsync(dPub[d], pub33 + (size_t)off[d] * 33, (size_t)c * 33, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dHash[d], hash32 + (size_t)off[d] * 32, (size_t)c * 32, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(dSig[d], sig64 + (size_t)off[d] * 64, (size_t)c * 64, cudaMemcpyHostToDevice);
+        int threads = 128, blocks = (c + threads - 1) / threads;
+        verify_kernel<<<blocks, threads>>>(dPub[d], dHash[d], dSig[d], dRes[d], c);
+    }
+
+    // Phase 2: per-device synchronize and copy results back.
+    for (int d = 0; d < ndev; d++) {
+        if (cnt[d] <= 0 || dRes[d] == 0) continue;
+        cudaSetDevice(d);
+        cudaError_t se = cudaDeviceSynchronize();
+        if (se == cudaSuccess)
+            cudaMemcpy(results + off[d], dRes[d], (size_t)cnt[d], cudaMemcpyDeviceToHost);
+        else if (rc == 0)
+            rc = (int)se;
+        cudaFree(dPub[d]); cudaFree(dHash[d]); cudaFree(dSig[d]); cudaFree(dRes[d]);
+    }
+    return rc;
 }

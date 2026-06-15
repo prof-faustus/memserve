@@ -97,6 +97,34 @@ func TestUnspendDuringWindowReorg(t *testing.T) {
 	}
 }
 
+func TestOnNewBlockBackfillsTipJump(t *testing.T) {
+	// Defect-1 regression: spends across several heights must all be pruned even when
+	// the tip jumps (non-consecutive OnNewBlock calls), or memory leaks.
+	st := mem.New()
+	heights := []uint32{100, 101, 102, 103, 104}
+	for i, h := range heights {
+		st.PutUTXO(op(i), store.UTXO{Value: 1})
+		st.SpendUTXO(op(i), commitment.DoubleSHA256([]byte("s")), h)
+	}
+	pr := New(st, Policy{ReorgHorizon: 6, RecencyWindow: 0}) // D=6
+
+	// establish a baseline below any spend's eviction point.
+	pr.OnNewBlock(105) // target band 99 (empty)
+	// now JUMP the tip far ahead in one call: all of 100..104 reach depth > 6.
+	n, err := pr.OnNewBlock(200)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(heights) {
+		t.Fatalf("tip jump pruned %d bands, want %d (gap leaked!)", n, len(heights))
+	}
+	for i := range heights {
+		if _, ok, _ := st.GetUTXO(op(i)); ok {
+			t.Fatalf("spend %d survived the tip jump — leak", i)
+		}
+	}
+}
+
 func TestDepth(t *testing.T) {
 	if d := Depth(110, 100); d != 11 {
 		t.Fatalf("Depth(110,100)=%d want 11", d)

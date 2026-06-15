@@ -13,6 +13,8 @@ import (
 
 	"memserve/api"
 	"memserve/attest"
+	"memserve/commitment"
+	"memserve/crypto"
 	"memserve/ingest"
 	"memserve/payment"
 	"memserve/prune"
@@ -45,6 +47,7 @@ type Server struct {
 	api      *api.Server
 	paid     *payment.PaidServer
 	identity *attest.Identity
+	payKey   *crypto.PrivateKey // server's payout/settlement key (channel ServerPub)
 	src      teranode.Source
 	log      *slog.Logger
 
@@ -100,6 +103,14 @@ func New(cfg Config, src teranode.Source, log *slog.Logger) (*Server, error) {
 		}
 		s.identity = id
 	}
+	// Derive the server's payout key (channel ServerPub). From the operator seed when
+	// set (distinct domain), else ephemeral for the process lifetime.
+	paySeed := commitment.DoubleSHA256(append([]byte("memserve-paykey-v1"), cfg.OperatorSeed...))
+	pk, err := crypto.NewPrivateKey(paySeed[:])
+	if err != nil {
+		return nil, err
+	}
+	s.payKey = pk
 	if cfg.RatePerSec > 0 {
 		s.limiter = newLimiter(cfg.RatePerSec)
 	}

@@ -210,12 +210,17 @@ func (p *Populated) newPaidChannel(seed uint64) (*payment.PaidServer, *crypto.Pr
 	}
 	sd[31] = 1
 	priv, _ := crypto.NewPrivateKey(sd[:])
+	serverSeed := commitment.DoubleSHA256([]byte("memserve-bench-server"))
+	serverPriv, _ := crypto.NewPrivateKey(serverSeed[:])
 	fund := commitment.DoubleSHA256(append([]byte("memserve-bench-funding"), sd[:]...))
 	params := channel.Params{
-		ChannelID:        channel.DeriveChannelID(fund, 0),
-		FundingTxID:      fund,
-		FundingVout:      0,
-		ServerScriptHash: commitment.DoubleSHA256([]byte("server-payee")),
+		ChannelID:    channel.DeriveChannelID(fund, 0),
+		FundingTxID:  fund,
+		FundingVout:  0,
+		ClientPub:    priv.Public().SerializeCompressed(),
+		ServerPub:    serverPriv.Public().SerializeCompressed(),
+		FundingValue: 1 << 50,
+		Fee:          0,
 	}
 	_, _ = ps.OpenChannel(channel.Config{
 		Params:    params,

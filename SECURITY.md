@@ -69,6 +69,7 @@ BSV/Teranode only.
 | Invalid-commitment verify-flood | Cheap structural checks before the secp256k1 verify; per-channel `MaxBadAttempts` ban; bounded wasted work per funded channel. |
 | Replay / non-monotonic | Commitments must strictly increase cumulative; replays are rejected as underpaid. |
 | Settlement double-spend | Standard BSV channel: counter-signed `nLockTime` refund; server settles before `x' < x`. |
+| Open-ordering / funding malleability (Spillman) | Real tx layer (`bsvtx`) uses strict low-S + minimal-DER canonical encoding and a confirmed-funding default (channel usable only once the funding txid is final). Relies on BSV standardness/low-S policy; **final acceptance = BSV testnet broadcast** (§10.6). |
 
 ### DoS & resource exhaustion
 | Vector | Mitigation |

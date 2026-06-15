@@ -195,6 +195,31 @@ client's safety net and prepay ensuring the server is never owed.
 - Consistent with SPV trust model: payment is enforced cryptographically, and the served
   proof is still independently verified by the client against the PoW header chain.
 
+### 10.6 On-chain transaction layer (`bsvtx`) and the open-ordering caveat
+
+The channel signs **real BSV transactions**, not a bespoke message (the `bsvtx` package):
+
+- **Funding** locks the deposit in a bare **2-of-2** (`OP_2 <client> <server> OP_2
+  OP_CHECKMULTISIG`); payouts use **P2PK** (no RIPEMD-160 needed — valid BSV script).
+- A **commitment** is the client's **DER-encoded, low-S ECDSA signature over the FORKID
+  sighash** (BIP143-style preimage with the mandatory 0x40 flag) of the commitment tx that
+  pays the server `cum` and returns the change to the client. `SignCommitment` /
+  `Authorize` produce and verify exactly this.
+- **Settlement** (`Channel.SettlementTx`) co-signs the best commitment with the server key
+  and finalizes the 2-of-2 unlocking script (`OP_0 clientSig serverSig`) — a
+  **broadcastable** BSV transaction. **Refund** (`RefundTxUnsigned`) carries
+  `nLockTime = x` with a locktime-enabled input sequence.
+- secp256k1, SHA-256d, RFC 6979, low-S, FORKID. No CLTV/CSV, no SegWit/witness, no BTC
+  primitive anywhere.
+
+**Open-ordering / malleability (the classic Spillman exposure).** The refund is signed
+before the funding output is final; if the funding txid were third-party-malleable, the
+pre-signed refund's outpoint reference would break. MemServe mitigates this with **strict
+canonical encoding** (low-S enforced on both sign and verify; minimal DER) and a
+**confirmed-funding default**: the server should treat a channel as usable only once the
+funding tx is confirmed (its txid fixed). This relies on BSV's standardness/low-S policy;
+final acceptance must be verified by **broadcasting on BSV testnet** (the VM enables this).
+
 ### 10.5 Decisions (resolved)
 
 1. **Channel scope:** **per-shard channels** — many small channels, shares-nothing, no hub
@@ -382,6 +407,8 @@ boundary, the contract, and the correctness gate are all in place so dropping it
 ## 14. Build status
 
 **Built (v1):** sharding+routing; striped in-memory store + Aerospike adapter (tag);
+**real BSV on-chain channel tx layer** (`bsvtx`: funding 2-of-2, commitment/settlement/refund,
+FORKID sighash, DER+low-S — testnet broadcast is the remaining acceptance step, §10.6);
 Teranode ingest run-server **with Merkle-consistency anti-poisoning validation** and
 **reorg rollback**; real **Teranode HTTP adapter** (`teranode/httpsource`, tested vs a
 simulated Teranode); query API with honest post-prune semantics; BSV pay-per-use payment

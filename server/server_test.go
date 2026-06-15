@@ -126,8 +126,11 @@ func TestPaidQueryFlow(t *testing.T) {
 	clientSeed := commitment.DoubleSHA256([]byte("client"))
 	priv, _ := crypto.NewPrivateKey(clientSeed[:])
 	fund := commitment.DoubleSHA256([]byte("funding"))
+	serverSeed := commitment.DoubleSHA256([]byte("srv"))
+	serverPriv, _ := crypto.NewPrivateKey(serverSeed[:])
 	params := channel.Params{ChannelID: channel.DeriveChannelID(fund, 0), FundingTxID: fund,
-		ServerScriptHash: commitment.DoubleSHA256([]byte("payee"))}
+		ClientPub: priv.Public().SerializeCompressed(), ServerPub: serverPriv.Public().SerializeCompressed(),
+		FundingValue: 100000}
 	_, err := srv.Paid().OpenChannel(channel.Config{
 		Params: params, Deposit: 100000, ClientPub: priv.Public(),
 		Pricing: channel.Pricing{Flat: true, FlatPrice: 5, FeeMode: channel.FeeUpfront}, N: 100,

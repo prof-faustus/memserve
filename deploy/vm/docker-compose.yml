@@ -1,0 +1,55 @@
+# Full MemServe stack for a single VM: Aerospike + the memserved daemon.
+#
+# Default wiring uses the built-in MOCK Teranode source so the stack runs immediately.
+# To ingest a real chain, set MEMSERVE_TERANODE to your Teranode asset server and switch
+# the daemon command from -mock to -teranode (see the `command:` note below).
+#
+#   cd deploy/vm && docker compose up -d --build
+#   curl localhost:8080/readyz ; curl localhost:8080/metrics
+services:
+  aerospike:
+    image: aerospike/aerospike-server:7.1.0.0
+    container_name: memserve-aerospike
+    ports: ["3000:3000", "3001:3001", "3002:3002"]
+    volumes:
+      - ../aerospike.conf:/etc/aerospike/aerospike.conf:ro
+    command: ["--config-file", "/etc/aerospike/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-v", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  memserved:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        TAGS: aerospike
+    container_name: memserve-daemon
+    depends_on:
+      aerospike:
+        condition: service_healthy
+    ports: ["8080:8080"]
+    # Demo: mock source into the Aerospike store. For production, replace -mock with:
+    #   -teranode http://<teranode-asset-server>:8090
+    # and add -operator-seed <hex32> -admin-token <token> -min-deposit <sats> -rate <n>.
+    command:
+      - "-mock"
+      - "-addr=:8080"
+      - "-store=aerospike"
+      - "-aerospike-host=aerospike"
+      - "-aerospike-port=3000"
+      - "-aerospike-namespace=memserve"
+      - "-reorg-horizon=18"
+      - "-recency=12"
+    restart: unless-stopped
+
+  # --- Teranode (operator-supplied) -------------------------------------------
+  # Drop in your Teranode asset/data server here and point memserved's -teranode at it.
+  # The image/config is deployment-specific, so it is left as a template:
+  #
+  # teranode:
+  #   image: <your-teranode-image>
+  #   ports: ["8090:8090"]
+  #   volumes: ["./teranode.settings:/app/settings:ro"]

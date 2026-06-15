@@ -24,6 +24,7 @@ type openReq struct {
 	PerType        [4]uint64 `json:"perType"`
 	SettleFee      uint64    `json:"settleFee"`
 	FeeMode        uint8     `json:"feeMode"`
+	Fee            uint64    `json:"fee"` // miner fee reserved for the settling tx
 	N              uint64    `json:"n"`
 	RefundLockTime uint32    `json:"refundLockTime"`
 	SettleBefore   uint32    `json:"settleBefore"`
@@ -55,10 +56,13 @@ func (s *Server) handleChannelOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params := channel.Params{
-		ChannelID:        channel.DeriveChannelID(fund, req.Vout),
-		FundingTxID:      fund,
-		FundingVout:      req.Vout,
-		ServerScriptHash: serverPayee(s),
+		ChannelID:    channel.DeriveChannelID(fund, req.Vout),
+		FundingTxID:  fund,
+		FundingVout:  req.Vout,
+		ClientPub:    pub.SerializeCompressed(),
+		ServerPub:    s.payKey.Public().SerializeCompressed(),
+		FundingValue: req.Deposit,
+		Fee:          req.Fee,
 	}
 	pricing := channel.Pricing{Flat: req.Flat, FlatPrice: req.FlatPrice, SettleFee: req.SettleFee,
 		FeeMode: channel.FeeMode(req.FeeMode)}
@@ -73,15 +77,6 @@ func (s *Server) handleChannelOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"channelId": hexHash(params.ChannelID)})
-}
-
-func serverPayee(s *Server) store.Hash {
-	// In production this is the operator's receiving scriptHash; derive a stable value here.
-	var h store.Hash
-	if s.identity != nil {
-		copy(h[:], s.identity.Public().SerializeCompressed()[1:])
-	}
-	return h
 }
 
 func (s *Server) handleQuote(w http.ResponseWriter, r *http.Request) {

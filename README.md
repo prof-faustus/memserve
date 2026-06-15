@@ -12,12 +12,17 @@ Teranode.
 
 > **Status: implemented (v1), hardening toward production.** Full pipeline + a
 > commercial-grade HTTP/JSON server daemon, a real Teranode HTTP ingest adapter, pay-per-use
-> payment channels with abuse defenses, spend-depth pruning with a named reorg-horizon
-> correctness floor, a trust-minimizing multi-operator client, and signed-answer
+> payment channels (signing **real BSV transactions** — funding 2-of-2, commitment/settlement/
+> refund, FORKID sighash, DER+low-S) with abuse defenses, spend-depth pruning with a named
+> reorg-horizon correctness floor, a trust-minimizing multi-operator client, and signed-answer
 > accountability (fraud proofs bound to the miner). Tested in CI under `-race`. See
-> [`DESIGN.md`](./DESIGN.md) and [`SECURITY.md`](./SECURITY.md). Final deployment needs a
-> live Teranode (thin endpoint mapping), an Aerospike cluster (`aerospike` tag), and —
-> optionally — the GPU verify kernel (`cuda` tag, gated by `accel.Validate`).
+> [`DESIGN.md`](./DESIGN.md) and [`SECURITY.md`](./SECURITY.md).
+>
+> **Remaining for production (live-infra only):** broadcast-validate the channel txs on **BSV
+> testnet** (§10.6); point ingest at a **live Teranode** (thin endpoint mapping); run against an
+> **Aerospike cluster** (`aerospike` tag); and validate the **GPU verify kernel** (`cuda` tag,
+> gated by `accel.Validate`). The off-chain accounting, sighash, and tx construction are built
+> and tested; only consensus acceptance on a real network/cluster/GPU remains.
 
 ## What it answers
 

@@ -135,12 +135,16 @@ func demoPayment(p *bench.Populated) {
 	fmt.Printf("\n## Payment — prepay-then-serve (BSV channel, secp256k1)\n")
 	ps := payment.New(p.Server)
 	priv, _ := crypto.NewPrivateKey([]byte("memserve-demo-client-key-0000001"))
+	serverPriv, _ := crypto.NewPrivateKey([]byte("memserve-demo-server-key-0000001"))
 	fund := commitment.DoubleSHA256([]byte("demo-funding"))
 	params := channel.Params{
-		ChannelID:        channel.DeriveChannelID(fund, 0),
-		FundingTxID:      fund,
-		FundingVout:      0,
-		ServerScriptHash: commitment.DoubleSHA256([]byte("server-payee")),
+		ChannelID:    channel.DeriveChannelID(fund, 0),
+		FundingTxID:  fund,
+		FundingVout:  0,
+		ClientPub:    priv.Public().SerializeCompressed(),
+		ServerPub:    serverPriv.Public().SerializeCompressed(),
+		FundingValue: 100000,
+		Fee:          250,
 	}
 	pricing := channel.Pricing{Flat: false, SettleFee: 200, FeeMode: channel.FeeUpfront}
 	pricing.PerType[channel.QSeen] = 1

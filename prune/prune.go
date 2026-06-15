@@ -70,27 +70,54 @@ func (pr *Pruner) Policy() Policy { return pr.policy }
 // TotalPruned returns the cumulative number of records evicted.
 func (pr *Pruner) TotalPruned() uint64 { return atomic.LoadUint64(&pr.total) }
 
-// OnNewBlock runs the incremental sweep for a tip advance to height `tip`: it evicts
-// the single band of spends that has just reached depth D+1 (spentHeight = tip - D).
-// It is idempotent per height and skips heights not deep enough yet. Returns the
+// OnNewBlock runs the sweep for a tip advance to height `tip`: it evicts EVERY spend
+// band that has reached depth > D since the last call — all bands in
+// (lastTip-D, tip-D]. It does NOT assume it is called once per consecutive height, so a
+// tip jump (initial sync, catch-up after downtime, batch ingest) cannot leave skipped
+// bands unpruned (which would leak the spendsPerBlock×D memory bound). Returns the
 // number of records evicted by this call.
 //
-// Correctness: the evicted band sits at depth D+1 > ReorgHorizon, so a spend is
-// never freed while a tolerated reorg could still roll it back (§11.2).
+// Correctness: every evicted band sits at depth >= D+1 > ReorgHorizon, so a spend is
+// never freed while a tolerated reorg could still roll it back (§11.2). It only ever
+// under-/correctly-prunes, never inside the horizon.
 func (pr *Pruner) OnNewBlock(tip uint32) (int, error) {
 	d := pr.policy.D()
-	if uint32(tip) < d {
-		pr.lastTip, pr.hasTip = tip, true
+	prevTip, hadTip := pr.lastTip, pr.hasTip
+	pr.lastTip, pr.hasTip = tip, true
+	if tip < d {
 		return 0, nil // chain not yet D deep; nothing has crossed the cutoff
 	}
-	band := tip - d // this spentHeight has just reached depth d+1
-	n, err := pr.st.PruneSpentAtHeight(band)
-	if err != nil {
-		return 0, err
+	target := tip - d // highest band that has now reached depth d+1
+
+	// Lowest band not yet pruned.
+	var start uint32
+	switch {
+	case !hadTip:
+		// First call: establish a baseline at the current band. We do not backfill
+		// ancient history below the point ingestion began (no records exist there).
+		start = target
+	case prevTip >= d:
+		start = (prevTip - d) + 1 // first band after the one the previous call reached
+	default:
+		start = 0 // previously below depth D; nothing pruned yet, sweep from 0
 	}
-	atomic.AddUint64(&pr.total, uint64(n))
-	pr.lastTip, pr.hasTip = tip, true
-	return n, nil
+	if start > target {
+		return 0, nil
+	}
+
+	total := 0
+	for h := start; ; h++ {
+		n, err := pr.st.PruneSpentAtHeight(h)
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if h == target {
+			break
+		}
+	}
+	atomic.AddUint64(&pr.total, uint64(total))
+	return total, nil
 }
 
 // Depth returns the spend depth of a spend at spentHeight given the current tip

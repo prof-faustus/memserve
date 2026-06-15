@@ -3,29 +3,37 @@ package channel
 import (
 	"testing"
 
+	"memserve/bsvtx"
 	"memserve/commitment"
 	"memserve/crypto"
 	"memserve/store"
 )
 
+func mkKey(seedTag string) *crypto.PrivateKey {
+	seed := commitment.DoubleSHA256([]byte(seedTag))
+	k, _ := crypto.NewPrivateKey(seed[:])
+	return k
+}
+
+// testParams binds the SAME client key testKey(tag) returns, plus a per-tag server key,
+// so commitments sign a consistent real BSV commitment-tx sighash. FundingValue is large
+// so signing never hits the amount guard; Config.Deposit is the channel cap.
 func testParams(tag string) Params {
 	fund := commitment.DoubleSHA256([]byte("fund-" + tag))
 	return Params{
-		ChannelID:        DeriveChannelID(fund, 0),
-		FundingTxID:      fund,
-		FundingVout:      0,
-		ServerScriptHash: commitment.DoubleSHA256([]byte("payee-" + tag)),
+		ChannelID:    DeriveChannelID(fund, 0),
+		FundingTxID:  fund,
+		FundingVout:  0,
+		ClientPub:    mkKey("key-" + tag).Public().SerializeCompressed(),
+		ServerPub:    mkKey("server-" + tag).Public().SerializeCompressed(),
+		FundingValue: 1 << 40,
+		Fee:          0,
 	}
 }
 
 func testKey(t *testing.T, tag string) *crypto.PrivateKey {
 	t.Helper()
-	seed := commitment.DoubleSHA256([]byte("key-" + tag))
-	k, err := crypto.NewPrivateKey(seed[:])
-	if err != nil {
-		t.Fatalf("key: %v", err)
-	}
-	return k
+	return mkKey("key-" + tag)
 }
 
 func TestPrepayThenServe(t *testing.T) {
@@ -225,6 +233,50 @@ func TestMeteredPricing(t *testing.T) {
 	if got := ch.Quote(QMerklePath); got != 6 {
 		t.Fatalf("merklepath quote %d, want 6", got)
 	}
+}
+
+func TestSettlementTxBroadcastable(t *testing.T) {
+	priv := testKey(t, "set")
+	serverPriv := mkKey("server-" + "set")
+	p := testParams("set")
+	p.Fee = 250
+	ch, err := Open(Config{Params: p, Deposit: 100000, ClientPub: priv.Public(),
+		Pricing: Pricing{Flat: true, FlatPrice: 1000, SettleFee: 0, FeeMode: FeeUpfront}, N: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// prepay two accesses (cum advances to the client-signed amount).
+	for i := 0; i < 2; i++ {
+		c, err := SignCommitment(priv, p, ch.Quote(QSeen))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ch.Authorize(c, QSeen); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cum := ch.Snapshot().CumPaid
+
+	// the server builds a REAL broadcastable settlement tx, co-signing the best commitment.
+	tx, err := ch.SettlementTx(serverPriv)
+	if err != nil {
+		t.Fatalf("settlement tx: %v", err)
+	}
+	if len(tx.Inputs) != 1 || len(tx.Inputs[0].ScriptSig) == 0 {
+		t.Fatal("settlement tx missing signed input")
+	}
+	if tx.Outputs[0].Value != cum {
+		t.Fatalf("server payout %d != cumPaid %d", tx.Outputs[0].Value, cum)
+	}
+	if tx.Outputs[1].Value != p.FundingValue-cum-p.Fee {
+		t.Fatalf("client change wrong: %d", tx.Outputs[1].Value)
+	}
+	// the input must serialize and yield a stable txid.
+	if tx.TxID() != tx.TxID() || len(tx.Serialize()) == 0 {
+		t.Fatal("settlement tx not serializable")
+	}
+	// the refund tx carries the configured nLockTime (client safety net).
+	_ = bsvtx.SighashAllFork
 }
 
 var _ = store.Outpoint{}

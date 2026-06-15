@@ -28,6 +28,7 @@ import (
 	"errors"
 	"sync"
 
+	"memserve/bsvtx"
 	"memserve/commitment"
 	"memserve/crypto"
 	"memserve/store"
@@ -82,14 +83,31 @@ func ceilDiv(a, b uint64) uint64 {
 	return (a + b - 1) / b
 }
 
-// Params bind a commitment to a specific channel/funding output/payee. Client and
-// server agree on these at open; both sign/verify over them so a commitment cannot be
-// replayed against a different channel or payee.
+// Params bind a commitment to the channel's funding 2-of-2 output and both parties'
+// keys. A commitment is a signature over the REAL BSV commitment-transaction FORKID
+// sighash built from these (bsvtx), so it cannot be replayed against a different funding
+// output, payee or amount. Client and server agree on Params at open.
 type Params struct {
-	ChannelID        store.Hash
-	FundingTxID      store.Hash
-	FundingVout      uint32
-	ServerScriptHash store.Hash // the payee
+	ChannelID    store.Hash
+	FundingTxID  store.Hash // the 2-of-2 funding tx id (internal byte order)
+	FundingVout  uint32
+	ClientPub    []byte // compressed (33) — also the verifying key
+	ServerPub    []byte // compressed (33) — the payee
+	FundingValue uint64 // satoshis locked in the 2-of-2 output
+	Fee          uint64 // miner fee reserved for the settling tx
+}
+
+// channelTx reconstructs the on-chain channel-tx builder from Params.
+func (p Params) channelTx() bsvtx.ChannelTx {
+	var fund [32]byte
+	copy(fund[:], p.FundingTxID[:])
+	return bsvtx.ChannelTx{
+		FundingOut:   bsvtx.OutPoint{Hash: fund, Index: p.FundingVout},
+		FundingValue: p.FundingValue,
+		ClientPub:    p.ClientPub,
+		ServerPub:    p.ServerPub,
+		Fee:          p.Fee,
+	}
 }
 
 // Commitment is one prepay authorization: the client's signature over the cumulative
@@ -143,6 +161,14 @@ func Open(cfg Config) (*Channel, error) {
 	}
 	if cfg.RefundLockTime != 0 && cfg.SettleBefore != 0 && cfg.SettleBefore >= cfg.RefundLockTime {
 		return nil, ErrConfig // must settle before the client's refund matures
+	}
+	// Default the on-chain funded value to the channel capacity, and bind the client
+	// verifying key into Params if not already set.
+	if cfg.Params.FundingValue == 0 {
+		cfg.Params.FundingValue = cfg.Deposit
+	}
+	if len(cfg.Params.ClientPub) == 0 && cfg.ClientPub != nil {
+		cfg.Params.ClientPub = cfg.ClientPub.SerializeCompressed()
 	}
 	return &Channel{cfg: cfg}, nil
 }
@@ -277,42 +303,74 @@ func (ch *Channel) Refund() Refund {
 	return Refund{LockTime: ch.cfg.RefundLockTime, Amount: ch.cfg.Deposit, ToClient: true}
 }
 
-// --- commitment message + signing/verification ------------------------------
+// --- commitment signing/verification (over the REAL BSV commitment tx) -------
 
-// message builds the canonical bytes a commitment signs: it binds the channel id,
-// funding outpoint, payee and cumulative amount so a signature cannot be replayed.
-func message(p Params, cum uint64) []byte {
-	buf := make([]byte, 0, 32+32+4+32+8)
-	buf = append(buf, p.ChannelID[:]...)
-	buf = append(buf, p.FundingTxID[:]...)
-	buf = append(buf, byte(p.FundingVout), byte(p.FundingVout>>8), byte(p.FundingVout>>16), byte(p.FundingVout>>24))
-	buf = append(buf, p.ServerScriptHash[:]...)
-	buf = append(buf, byte(cum), byte(cum>>8), byte(cum>>16), byte(cum>>24),
-		byte(cum>>32), byte(cum>>40), byte(cum>>48), byte(cum>>56))
-	return buf
-}
-
-func sighash(p Params, cum uint64) []byte {
-	h := commitment.DoubleSHA256(message(p, cum))
-	return h[:]
+// sighash returns the FORKID sighash of the BSV commitment transaction that pays the
+// server `cum` from the funding 2-of-2 output. This is the actual thing the client
+// signs — a real Bitcoin signature hash, not a bespoke message.
+func sighash(p Params, cum uint64) ([]byte, error) {
+	return p.channelTx().CommitmentSighash(cum)
 }
 
 func verify(pub *crypto.PublicKey, p Params, cum uint64, sig *crypto.Signature) bool {
 	if !sig.IsLowS() { // reject malleable (high-S) commitments
 		return false
 	}
-	return crypto.Verify(pub, sighash(p, cum), sig)
+	h, err := sighash(p, cum)
+	if err != nil {
+		return false
+	}
+	return crypto.Verify(pub, h, sig)
 }
 
-// SignCommitment is the CLIENT side: it signs a cumulative authorization for the given
-// channel params. The signature is deterministic (RFC 6979) and low-S.
+// SignCommitment is the CLIENT side: it signs the commitment-tx FORKID sighash that pays
+// the server `cum`. Deterministic (RFC 6979) and low-S. Errors if cum+fee exceeds the
+// funded value (the client cannot authorize spending more than is locked).
 func SignCommitment(priv *crypto.PrivateKey, p Params, cum uint64) (*Commitment, error) {
-	sig, err := priv.Sign(sighash(p, cum))
+	h, err := sighash(p, cum)
+	if err != nil {
+		return nil, err
+	}
+	sig, err := priv.Sign(h)
 	if err != nil {
 		return nil, err
 	}
 	return &Commitment{CumAmount: cum, Sig: sig}, nil
 }
+
+// SettlementTx builds the BROADCASTABLE settlement transaction: the best (largest) client
+// commitment co-signed by the server, spending the funding 2-of-2 to pay the server
+// cumPaid and return the change to the client. Call after a settlement trigger fires.
+func (ch *Channel) SettlementTx(serverPriv *crypto.PrivateKey) (*bsvtx.Tx, error) {
+	ch.mu.Lock()
+	best := ch.best
+	cum := ch.cumPaid
+	ch.mu.Unlock()
+	if best == nil {
+		return nil, errors.New("channel: no commitment to settle")
+	}
+	c := ch.cfg.Params.channelTx()
+	tx, err := c.CommitmentTx(cum)
+	if err != nil {
+		return nil, err
+	}
+	serverSig, err := bsvtx.SignInput(serverPriv, tx, 0, c.Redeem(), c.FundingValue, bsvtx.SighashAllFork)
+	if err != nil {
+		return nil, err
+	}
+	clientSig := append(derFromSig(best.Sig), byte(bsvtx.SighashAllFork))
+	bsvtx.Finalize2of2(tx, clientSig, serverSig)
+	return tx, nil
+}
+
+// RefundTxUnsigned returns the client's refund transaction (nLockTime = RefundLockTime),
+// which both parties sign at open (the server pre-signs). Spendable only at/after x.
+func (ch *Channel) RefundTxUnsigned() *bsvtx.Tx {
+	return ch.cfg.Params.channelTx().RefundTx(ch.cfg.RefundLockTime)
+}
+
+// derFromSig converts an (r,s) signature to the DER form used inside a scriptSig.
+func derFromSig(s *crypto.Signature) []byte { return bsvtx.DEREncode(s.R, s.S) }
 
 // DeriveChannelID derives a channel id from the funding outpoint.
 func DeriveChannelID(fundingTxID store.Hash, vout uint32) store.Hash {

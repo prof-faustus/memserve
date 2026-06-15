@@ -30,11 +30,14 @@ func populated(t *testing.T) (*api.Server, store.Hash) {
 func openChannel(t *testing.T, ps *payment.PaidServer, priv *crypto.PrivateKey) channel.Params {
 	t.Helper()
 	fund := commitment.DoubleSHA256([]byte("paid-test-fund"))
+	serverPriv := key("paid-test-server")
 	p := channel.Params{
-		ChannelID:        channel.DeriveChannelID(fund, 0),
-		FundingTxID:      fund,
-		FundingVout:      0,
-		ServerScriptHash: commitment.DoubleSHA256([]byte("payee")),
+		ChannelID:    channel.DeriveChannelID(fund, 0),
+		FundingTxID:  fund,
+		FundingVout:  0,
+		ClientPub:    priv.Public().SerializeCompressed(),
+		ServerPub:    serverPriv.Public().SerializeCompressed(),
+		FundingValue: 1 << 40,
 	}
 	_, err := ps.OpenChannel(channel.Config{
 		Params: p, Deposit: 100000, ClientPub: priv.Public(),
@@ -111,7 +114,8 @@ func TestAbuseMinDepositAndMaxChannels(t *testing.T) {
 	mk := func(tag string, deposit uint64) channel.Config {
 		fund := commitment.DoubleSHA256([]byte(tag))
 		p := channel.Params{ChannelID: channel.DeriveChannelID(fund, 0), FundingTxID: fund,
-			ServerScriptHash: commitment.DoubleSHA256([]byte("payee"))}
+			ClientPub: priv.Public().SerializeCompressed(), ServerPub: key("srv").Public().SerializeCompressed(),
+			FundingValue: deposit}
 		return channel.Config{Params: p, Deposit: deposit, ClientPub: priv.Public(),
 			Pricing: channel.Pricing{Flat: true, FlatPrice: 1, FeeMode: channel.FeeUpfront}, N: 100}
 	}
