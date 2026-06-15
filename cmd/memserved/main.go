@@ -52,6 +52,8 @@ func main() {
 	rate := flag.Int("rate", 0, "per-client requests/sec (0 = unlimited)")
 	minDeposit := flag.Uint64("min-deposit", 0, "minimum channel deposit (abuse defense)")
 	maxChannels := flag.Int("max-channels", 0, "max concurrent channels (0 = unlimited)")
+	maxMemMB := flag.Int("max-mem-mb", 4096, "pause ingestion when the heap exceeds this many MB (0 = unlimited)")
+	mockBlocks := flag.Int("mock-blocks", 300, "mock source: number of blocks to ingest then stop growing")
 	storeKind := flag.String("store", "mem", "store backend: mem | aerospike (aerospike needs -tags aerospike)")
 	aeroHost := flag.String("aerospike-host", "127.0.0.1", "Aerospike host")
 	aeroPort := flag.Int("aerospike-port", 3000, "Aerospike port")
@@ -63,7 +65,7 @@ func main() {
 	var src teranode.Source
 	switch {
 	case *mock:
-		src = teranode.NewMock(teranode.MockConfig{Blocks: 1 << 30, SubtreesPer: 4, TxsPerSubtree: 2048, SpendFraction: 3})
+		src = teranode.NewMock(teranode.MockConfig{Blocks: *mockBlocks, SubtreesPer: 4, TxsPerSubtree: 2048, SpendFraction: 3})
 	case *teranodeURL != "":
 		src = httpsource.New(httpsource.Config{BaseURL: *teranodeURL, StartHeight: 0, PollEvery: time.Second})
 	default:
@@ -104,6 +106,7 @@ func main() {
 		AdminToken:      *adminToken,
 		RatePerSec:      *rate,
 		Store:           st,
+		MaxMemMB:        *maxMemMB,
 	}, src, log)
 	if err != nil {
 		log.Error("server init", "err", err)

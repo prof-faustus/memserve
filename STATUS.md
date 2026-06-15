@@ -48,6 +48,21 @@ Docs: `DESIGN.md`, `SECURITY.md` (every audited attack vector → mitigation), `
 - **Aerospike**: `make aerospike-up && make aerospike-test` against your cluster.
 - **GPU (3 cards)**: `bash deploy/gpu/setup.sh` — builds the multi-GPU kernel and validates it via `cmd/accelcheck`.
 
+## Memory bounding (important)
+
+The in-memory store grows with chain history (TxIndex / subtree / block maps are not
+depth-pruned — only spent UTXOs are). To stop a long/looping ingest from consuming the
+host, `memserved` has:
+
+- `-max-mem-mb` (default 4096): a watchdog that **pauses ingestion** when the process heap
+  exceeds it (no block dropped; the store keeps serving). `/metrics` exposes
+  `memserve_heap_bytes` and `memserve_max_mem_mb`.
+- `-mock-blocks` (default 300): the mock source ingests a bounded number of blocks, then
+  stops growing (the old default ran unbounded and could exhaust RAM).
+
+For unbounded production retention use the **Aerospike** backend (`-store aerospike`,
+disk-backed) rather than the in-memory store, and/or set `-max-mem-mb` to ~75% of box RAM.
+
 ## Run
 
 ```sh

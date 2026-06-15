@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +38,7 @@ type Config struct {
 	RequestTimeout  time.Duration  // per-request timeout (default 15s)
 	PollEvery       time.Duration  // ingest poll interval when caught up (default 1s)
 	Store           store.Store    // backend; if nil, an in-memory store is used
+	MaxMemMB        int            // pause ingestion when the process heap exceeds this (0 = unlimited)
 }
 
 // Server is a running MemServe shard service.
@@ -207,11 +209,33 @@ func (s *Server) IngestOnce() error {
 }
 
 func (s *Server) ingestLoop(ctx context.Context) {
+	var lastWarn time.Time
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+		}
+		// Memory watchdog: if the heap exceeds MaxMemMB, PAUSE ingestion (do not fetch
+		// the next block) until memory frees. This stops unbounded growth from taking the
+		// host down; no block is dropped (we just don't advance). The store keeps serving.
+		if s.cfg.MaxMemMB > 0 {
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			if int(ms.HeapAlloc/(1<<20)) >= s.cfg.MaxMemMB {
+				if time.Since(lastWarn) > 30*time.Second {
+					s.log.Warn("ingest paused: heap at memory limit",
+						"heapMB", ms.HeapAlloc/(1<<20), "maxMemMB", s.cfg.MaxMemMB, "tip", s.tip.Load())
+					lastWarn = time.Now()
+				}
+				s.ready.Store(true)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(s.cfg.PollEvery):
+				}
+				continue
+			}
 		}
 		b, ok, err := s.src.Next()
 		if err != nil {
@@ -294,6 +318,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "memserve_served_total %d\n", s.met.served.Load())
 	fmt.Fprintf(w, "memserve_rejected_total %d\n", s.met.rejected.Load())
 	fmt.Fprintf(w, "memserve_blocks_ingested %d\n", s.met.blocks.Load())
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	fmt.Fprintf(w, "memserve_heap_bytes %d\n", ms.HeapAlloc)
+	fmt.Fprintf(w, "memserve_max_mem_mb %d\n", s.cfg.MaxMemMB)
 	fmt.Fprintf(w, "memserve_tip_height %d\n", s.tip.Load())
 	fmt.Fprintf(w, "memserve_txindex %d\n", st.TxIndex)
 	fmt.Fprintf(w, "memserve_utxo_live %d\n", st.UTXOLive)
