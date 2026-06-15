@@ -128,6 +128,32 @@ func (s *Store) UnspendUTXO(op store.Outpoint) (bool, error) {
 	return true, nil
 }
 
+func (s *Store) DeleteUTXO(op store.Outpoint) (bool, error) {
+	st := s.st[striperOf(op.TxID)]
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	u, ok := st.utxo[op]
+	if !ok {
+		return false, nil
+	}
+	if u.Spent {
+		deindexSpent(st, op, u.SpentHeight)
+	}
+	delete(st.utxo, op)
+	return true, nil
+}
+
+func (s *Store) DeleteTxIndex(txid store.Hash) (bool, error) {
+	st := s.st[striperOf(txid)]
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if _, ok := st.txindex[txid]; !ok {
+		return false, nil
+	}
+	delete(st.txindex, txid)
+	return true, nil
+}
+
 func indexSpent(st *stripe, op store.Outpoint, h uint32) {
 	set := st.spentIdx[h]
 	if set == nil {

@@ -10,11 +10,14 @@ side** — *serving* the Merkle proof and answering *"is this tx mined?"* MemSer
 into a distributed **O(1) in-memory key lookup** backed by Aerospike, pulling its data from
 Teranode.
 
-> **Status: implemented (v0).** The full pipeline is built, tested, and benchmarkable
-> offline against a deterministic mock Teranode source. See [`DESIGN.md`](./DESIGN.md)
-> for the design rationale. The real Teranode ingest adapter and a live Aerospike
-> cluster are the deployment steps; the Aerospike-backed store is implemented behind the
-> `aerospike` build tag.
+> **Status: implemented (v1), hardening toward production.** Full pipeline + a
+> commercial-grade HTTP/JSON server daemon, a real Teranode HTTP ingest adapter, pay-per-use
+> payment channels with abuse defenses, spend-depth pruning with a named reorg-horizon
+> correctness floor, a trust-minimizing multi-operator client, and signed-answer
+> accountability (fraud proofs bound to the miner). Tested in CI under `-race`. See
+> [`DESIGN.md`](./DESIGN.md) and [`SECURITY.md`](./SECURITY.md). Final deployment needs a
+> live Teranode (thin endpoint mapping), an Aerospike cluster (`aerospike` tag), and —
+> optionally — the GPU verify kernel (`cuda` tag, gated by `accel.Validate`).
 
 ## What it answers
 
@@ -45,18 +48,33 @@ For a `txid` (and optionally `outpoint = txid:vout`):
 ## Layout
 
 ```
-cmd/memserve   demo + benchmark (ingest -> serve -> verify -> pay -> shard extrapolation)
-cmd/ingest     the run server: pulls a (mock) Teranode source, drives spend-depth pruning
+cmd/memserved  the production daemon (HTTP/JSON server; -mock or -teranode <url>)
+cmd/memserve   demo + benchmark (ingest -> serve -> verify -> pay -> accel -> shard scale)
+cmd/ingest     standalone ingest demo: pulls a Teranode source, drives spend-depth pruning
+server/        commercial HTTP/JSON service: health, metrics, rate limit, admin, signed answers
 shard/         hash-prefix sharding + stateless routing (k bits -> 2^k shards)
 store/         Store interface + records; store/mem (striped, default), store/aerospike (tag)
-teranode/      read-only ingest source + deterministic Merkle-consistent mock
-ingest/        indexes blocks into a shard's store, owns only its prefix
+teranode/      ingest source + Merkle-consistent mock; teranode/httpsource (real HTTP adapter)
+ingest/        indexes blocks (with anti-poisoning validation), reorg rollback, prune driver
 proof/         Merkle-path assembly + verification (reuses the commitment fold)
 api/           Seen / Mined / MerklePath / UTXO, with honest post-prune semantics
 prune/         spend-depth retention with the named reorg-horizon correctness floor
-payment/       pay-per-use BSV channel (prepay-then-serve) + payment-gated server
+payment/       pay-per-use BSV channel (prepay-then-serve) + abuse defenses + alert path
+attest/        signed answers, miner endorsement, fraud proofs (accountability)
+client/        trust-minimizing multi-operator client (verify proofs; quorum; fraud detection)
+accel/         batch secp256k1 verify (CPU + cuda tag), batching gate, differential validator
 commitment/    SHA-256d Merkle core (vendored from MF-SPV)
 crypto/        secp256k1 ECDSA, RFC 6979, low-S, constant-time scalar mult (vendored from MF-SPV)
+```
+
+## Run the server (miner sidecar)
+
+```sh
+go run ./cmd/memserved -mock -addr :8080                      # demo against the built-in mock
+go run ./cmd/memserved -teranode http://teranode:8090 \
+   -operator-seed <hex32> -admin-token <tok> -min-deposit 100000 -rate 500
+# probes: /healthz /readyz /metrics ; queries: /v1/seen|mined|merklepath|utxo ;
+# payment: /v1/channel/open /v1/quote /v1/paid/query ; admin: /admin/stats (Bearer token)
 ```
 
 ## Build / test / run

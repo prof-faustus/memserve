@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"time"
 
+	"memserve/accel"
 	"memserve/api"
 	"memserve/bench"
 	"memserve/commitment"
@@ -70,7 +71,10 @@ func main() {
 	paid := p.PaidThroughput(*cores, *dur)
 	fmt.Printf("\n## Paid path — prepay-then-serve with real secp256k1 verify (%d cores)\n", *cores)
 	fmt.Printf("  %.3e paid-answers/s  (sig-bound: this is the true metered-access cost, far below\n", paid)
-	fmt.Printf("   the free in-memory lookup rate above; production would batch/precompute sigs).\n")
+	fmt.Printf("   the free in-memory lookup rate above).\n")
+
+	// --- accel: batch signature verification (the GPU/accel target) ---
+	demoAccel(*cores, *dur)
 
 	// --- shares-nothing shard extrapolation ---
 	fmt.Printf("\n## Shares-nothing shard extrapolation (per-shard rate x 2^k shards)\n")
@@ -80,6 +84,25 @@ func main() {
 		fmt.Printf("    k=%-2d -> %-10d shards -> %.3e answers/s\n", k, n, bestParallel*float64(n))
 	}
 	fmt.Printf("  (hash-prefix sharding: uniform load, stateless routing, elastic split — DESIGN §6.)\n")
+}
+
+func demoAccel(cores int, dur time.Duration) {
+	fmt.Printf("\n## Signature-verify acceleration (accel) — the GPU target\n")
+	if err := accel.Validate(accel.NewCPU(), 256); err != nil {
+		fmt.Println("  CPU backend FAILED the correctness gate:", err)
+		return
+	}
+	fmt.Printf("  correctness gate: CPU backend passes accel.Validate (vs the Go reference)\n")
+	refBatch := accel.MakeBatch(64)
+	cpuBatch := accel.MakeBatch(2048)
+	ref := accel.Throughput(accel.Reference{}, refBatch, dur)
+	cpu := accel.Throughput(accel.NewCPU(), cpuBatch, dur)
+	fmt.Printf("  reference (serial, 1 core): %.3e verify/s\n", ref)
+	fmt.Printf("  CPU batch (%d cores):        %.3e verify/s  (%.1fx)\n", cores, cpu, cpu/ref)
+	fmt.Printf("  NB: the pure-Go math/big verifier is slow (~1e2/core) and scales sub-linearly\n")
+	fmt.Printf("   (allocator/GC pressure) — which is exactly why this is the GPU/libsecp256k1 target.\n")
+	fmt.Printf("  GPU (accel.CUDA, -tags cuda) drops in behind accel.Gate once it passes the same\n")
+	fmt.Printf("   gate; literature puts batched GPU secp256k1 at ~1e5-1e6 verify/s/card.\n")
 }
 
 func demoQueries(p *bench.Populated) {

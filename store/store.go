@@ -73,6 +73,10 @@ type Store interface {
 	SpendUTXO(op Outpoint, spentBy Hash, spentHeight uint32) (bool, error)
 	// UnspendUTXO reverts a spend (reorg rollback); returns false if absent.
 	UnspendUTXO(op Outpoint) (bool, error)
+	// DeleteUTXO removes an output entirely (reorg rollback of a created output).
+	DeleteUTXO(op Outpoint) (bool, error)
+	// DeleteTxIndex removes a tx's index entry (reorg rollback).
+	DeleteTxIndex(txid Hash) (bool, error)
 
 	// Subtree leaves (the txids of a subtree), keyed by subtree root.
 	PutSubtree(root Hash, leaves []Hash) error

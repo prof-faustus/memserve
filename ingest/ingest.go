@@ -6,29 +6,40 @@
 package ingest
 
 import (
+	"errors"
+
+	"memserve/commitment"
+	"memserve/proof"
 	"memserve/prune"
 	"memserve/shard"
 	"memserve/store"
 	"memserve/teranode"
 )
 
+// ErrInvalidBlock is returned when a block from Teranode fails internal Merkle
+// consistency — the anti-"ingest poisoning" check (DESIGN.md §15). Malformed data is
+// rejected and nothing is stored.
+var ErrInvalidBlock = errors.New("ingest: block failed Merkle-consistency validation")
+
 // Ingestor writes Teranode data into one shard's store.
 type Ingestor struct {
-	st     store.Store
-	pruner *prune.Pruner
-	k      uint   // shard prefix width (0 = single shard, ingest all)
-	id     uint32 // this server's shard id
+	st           store.Store
+	pruner       *prune.Pruner
+	k            uint   // shard prefix width (0 = single shard, ingest all)
+	id           uint32 // this server's shard id
+	skipValidate bool
 }
 
 // Config parameters an Ingestor.
 type Config struct {
-	K  uint   // shard prefix width; 0 means a single (un-sharded) server
-	ID uint32 // this server's shard id (must be < 2^K)
+	K            uint   // shard prefix width; 0 means a single (un-sharded) server
+	ID           uint32 // this server's shard id (must be < 2^K)
+	SkipValidate bool   // skip Merkle-consistency validation (only if Teranode is trusted/pre-validated)
 }
 
 // New builds an Ingestor over a store and pruner.
 func New(st store.Store, pruner *prune.Pruner, cfg Config) *Ingestor {
-	return &Ingestor{st: st, pruner: pruner, k: cfg.K, id: cfg.ID}
+	return &Ingestor{st: st, pruner: pruner, k: cfg.K, id: cfg.ID, skipValidate: cfg.SkipValidate}
 }
 
 // owns reports whether this shard owns txid.
@@ -48,9 +59,37 @@ type Stats struct {
 	Pruned     int
 }
 
+// validateBlock recomputes every subtree root from its txids, the block root from the
+// subtree roots, and checks both against what Teranode claimed and the header's committed
+// root. This rejects malformed/poisoned ingest data before any of it is indexed.
+func validateBlock(b teranode.Block) error {
+	if len(b.Subtrees) != len(b.SubtreeRoots) {
+		return ErrInvalidBlock
+	}
+	for i, sub := range b.Subtrees {
+		root, err := commitment.MerkleRoot(sub.TxIDs)
+		if err != nil || root != sub.Root || root != b.SubtreeRoots[i] {
+			return ErrInvalidBlock
+		}
+	}
+	blockRoot, err := commitment.MerkleRoot(b.SubtreeRoots)
+	if err != nil || blockRoot != b.MerkleRoot {
+		return ErrInvalidBlock
+	}
+	if proof.HeaderMerkleRoot(b.Header) != b.MerkleRoot {
+		return ErrInvalidBlock
+	}
+	return nil
+}
+
 // IngestBlock indexes one sealed block into this shard's store and runs the pruner.
 func (in *Ingestor) IngestBlock(b teranode.Block) (Stats, error) {
 	var st Stats
+	if !in.skipValidate {
+		if err := validateBlock(b); err != nil {
+			return st, err
+		}
+	}
 	// Store the block's subtree leaves and the block record + header.
 	for _, sub := range b.Subtrees {
 		// Only store subtrees that contain at least one owned tx (cheap: store all
@@ -134,6 +173,37 @@ func (in *Ingestor) IngestBlock(b teranode.Block) (Stats, error) {
 		st.Pruned = n
 	}
 	return st, nil
+}
+
+// RollbackBlock reverses IngestBlock for a reorged-out block (DESIGN.md §11.2): it
+// un-spends the inputs that block's txs consumed (restoring those outputs to unspent),
+// and deletes the outputs and tx-index entries that block created. This is correct ONLY
+// because spend-depth pruning never evicts within the reorg horizon (the record is still
+// present to roll back) — which is exactly why D >= ReorgHorizon is a correctness floor.
+func (in *Ingestor) RollbackBlock(b teranode.Block) error {
+	for _, sub := range b.Subtrees {
+		for _, tx := range sub.Txs {
+			if !in.owns(tx.TxID) {
+				continue
+			}
+			// restore the inputs this tx spent.
+			for _, op := range tx.Inputs {
+				if _, err := in.st.UnspendUTXO(op); err != nil {
+					return err
+				}
+			}
+			// remove the outputs this tx created and its index entry.
+			for vout := range tx.Outputs {
+				if _, err := in.st.DeleteUTXO(store.Outpoint{TxID: tx.TxID, Vout: uint32(vout)}); err != nil {
+					return err
+				}
+			}
+			if _, err := in.st.DeleteTxIndex(tx.TxID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Run drains the source, ingesting every block, accumulating stats.

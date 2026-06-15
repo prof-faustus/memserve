@@ -101,3 +101,19 @@ func Depth(tip, spentHeight uint32) uint32 {
 	}
 	return tip - spentHeight + 1
 }
+
+// RecommendedPolicy returns a conservative, safety-first policy: a reorg horizon well
+// beyond any plausible BSV reorg plus a small recency window. Operators should only
+// REDUCE the reorg horizon with deliberate justification (the floor is a correctness
+// requirement, not a tuning knob — DESIGN.md §11.2). Defaults: ReorgHorizon=18,
+// RecencyWindow=12 (D=30 blocks, ~5 hours of trailing spend history).
+func RecommendedPolicy() Policy {
+	return Policy{ReorgHorizon: 18, RecencyWindow: 12}
+}
+
+// EstimateRetainedSpends estimates the steady-state number of spent records retained
+// (the bounded part of memory): spendsPerBlock * D. The live UTXO set is separate and
+// not pruned. Use this to size a box for a given chain spend rate and depth.
+func EstimateRetainedSpends(spendsPerBlock uint64, p Policy) uint64 {
+	return spendsPerBlock * uint64(p.D())
+}

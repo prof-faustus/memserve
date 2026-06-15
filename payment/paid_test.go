@@ -100,3 +100,64 @@ func TestUnknownChannel(t *testing.T) {
 		t.Fatalf("want ErrNoChannel, got %v", err)
 	}
 }
+
+func TestAbuseMinDepositAndMaxChannels(t *testing.T) {
+	srv, _ := populated(t)
+	var alerts []payment.Alert
+	ps := payment.NewWithPolicy(srv, payment.Policy{MinDeposit: 1000, MaxChannels: 1, MaxBadAttempts: 3},
+		payment.NotifierFunc(func(a payment.Alert) { alerts = append(alerts, a) }))
+
+	priv := key("client")
+	mk := func(tag string, deposit uint64) channel.Config {
+		fund := commitment.DoubleSHA256([]byte(tag))
+		p := channel.Params{ChannelID: channel.DeriveChannelID(fund, 0), FundingTxID: fund,
+			ServerScriptHash: commitment.DoubleSHA256([]byte("payee"))}
+		return channel.Config{Params: p, Deposit: deposit, ClientPub: priv.Public(),
+			Pricing: channel.Pricing{Flat: true, FlatPrice: 1, FeeMode: channel.FeeUpfront}, N: 100}
+	}
+	// deposit below MinDeposit is rejected (attacker can't open cheap channels).
+	if _, err := ps.OpenChannel(mk("c1", 500)); err != payment.ErrDepositTooSmall {
+		t.Fatalf("want ErrDepositTooSmall, got %v", err)
+	}
+	// first funded channel opens; second exceeds MaxChannels (open-flood defeated).
+	if _, err := ps.OpenChannel(mk("c2", 5000)); err != nil {
+		t.Fatalf("funded open failed: %v", err)
+	}
+	if _, err := ps.OpenChannel(mk("c3", 5000)); err != payment.ErrTooManyChannels {
+		t.Fatalf("want ErrTooManyChannels, got %v", err)
+	}
+	if len(alerts) < 2 {
+		t.Fatalf("operator not alerted on abuse: %d alerts", len(alerts))
+	}
+}
+
+func TestAbuseBadAttemptBan(t *testing.T) {
+	srv, txid := populated(t)
+	var banned bool
+	ps := payment.NewWithPolicy(srv, payment.Policy{MaxBadAttempts: 3},
+		payment.NotifierFunc(func(a payment.Alert) {
+			if a.Kind == payment.AlertChannelBanned {
+				banned = true
+			}
+		}))
+	priv := key("client")
+	other := key("attacker")
+	p := openChannel(t, ps, priv)
+
+	cum, _ := ps.Quote(p.ChannelID, channel.QMined)
+	// flood invalid (wrong-key) commitments; after the budget the channel is banned.
+	for i := 0; i < 3; i++ {
+		bad, _ := channel.SignCommitment(other, p, cum)
+		if _, err := ps.Mined(p.ChannelID, bad, txid); err != channel.ErrBadSig {
+			t.Fatalf("attempt %d: want ErrBadSig, got %v", i, err)
+		}
+	}
+	if !banned {
+		t.Fatal("channel not banned after exceeding bad-attempt budget")
+	}
+	// even a VALID commitment is now refused — the flood cost the attacker its channel.
+	good, _ := channel.SignCommitment(priv, p, cum)
+	if _, err := ps.Mined(p.ChannelID, good, txid); err != payment.ErrChannelBanned {
+		t.Fatalf("want ErrChannelBanned after ban, got %v", err)
+	}
+}

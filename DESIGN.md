@@ -329,10 +329,122 @@ decision **unless we also prune them** on their own depth/retention policy (§11
 │   │                          settle-on-n-or-time, refund timelock (reuses MF-SPV crypto)
 │   └── channel/             ← channel state, commitment verify, settlement triggers
 ├── api/                     ← query API: Seen / Mined / MerklePath / UTXO (payment-gated)
+├── accel/                   ← batch-verify backend (CPU + CUDA tag), batching gate, validator
+│   └── cuda/                ← CUDA host launcher + ABI header for the GPU secp256k1 backend
 └── bench/                   ← sharded lookup-throughput + paid-access benchmark
 ```
 
-## 13. What I will do once you confirm understanding
+## 13. GPU / hardware acceleration
+
+GPU helps **only** the two compute-bound parts — which are exactly the bottlenecks the
+benchmarks expose — and is the **wrong tool** for the lookups themselves.
+
+### 13.1 Where GPU pays off
+
+1. **secp256k1 signature verification (the paid-access ceiling).** Per-access metering
+   produces a stream of independent ECDSA verifications — embarrassingly parallel. The
+   pure-Go `math/big` verifier does ~10³/core; batched GPU secp256k1 reaches ~10⁵–10⁶/s
+   per card in the literature. This is the single biggest win, and the server only ever
+   **verifies** (the client signs on its own device), so it is pure offload.
+2. **SHA-256d Merkle path/tree construction (the pull cost).** `MerklePath` rebuilds
+   subtree/block trees on read; SHA-256d batches superbly on GPUs. *Caveat:* caching
+   precomputed paths turns this into an O(1) lookup and avoids the hashing entirely, so
+   GPU here is the answer only if build-on-read is chosen over caching.
+
+### 13.2 Where GPU does NOT help
+
+The **Seen / Mined / UTXO** lookups (~10⁸/s) are random key→value probes — **memory-latency
+bound**, not compute. PCIe transfer and limited VRAM make GPU a poor fit; the right lever
+is the **shares-nothing sharding** already built (per-shard × 2ᵏ). GPU is not used here.
+
+### 13.3 How it attaches (without polluting the pure-Go core)
+
+- A **`BatchVerifier` interface** (`accel`): `VerifyBatch([]Request, []bool)`. The default
+  is a **CPU parallel backend** (real, tested) that fans the batch across cores; a
+  **CUDA backend** (behind the `cuda` build tag, CGo → `accel/cuda`) drops in unchanged.
+- A **batching gate** collects per-access commitments up to a max batch size or a max
+  delay, flushes them through the backend, and scatters results — trading a little latency
+  for throughput (right for a throughput server).
+- A **differential validator** (`accel.Validate`) checks *any* backend against the
+  single-signature reference over random vectors. **This is the correctness gate**: a GPU
+  kernel is only trusted once it passes the validator, so a wrong kernel can never silently
+  serve. Verification is over public data, so the GPU path need not be constant-time.
+
+### 13.4 Honest scope of the GPU build
+
+The CPU batch backend, the gate, the validator and the benchmark are **built and tested**.
+The **CUDA backend is the FFI boundary** — Go CGo binding + ABI header + host launcher —
+into which a vetted GPU secp256k1 verify kernel is linked; it requires `nvcc` + a GPU and
+is **gated by `accel.Validate`** before use (not claimed hardware-tested in this repo). The
+secp256k1 device math is the one piece that must be written/validated on a CUDA box — the
+boundary, the contract, and the correctness gate are all in place so dropping it in is safe.
+
+## 14. Build status
+
+**Built (v1):** sharding+routing; striped in-memory store + Aerospike adapter (tag);
+Teranode ingest run-server **with Merkle-consistency anti-poisoning validation** and
+**reorg rollback**; real **Teranode HTTP adapter** (`teranode/httpsource`, tested vs a
+simulated Teranode); query API with honest post-prune semantics; BSV pay-per-use payment
+channel (prepay-then-serve, per-shard, configurable pricing, settle on n/time, built-in
+settle fee, nLockTime refund) **+ abuse defenses** (deposit floor, channel cap, bad-attempt
+ban, operator alert path); spend-depth pruning with the named reorg-horizon floor +
+conservative defaults + sizing helper; **accountability** (`attest`: signed answers, miner
+endorsement, fraud proofs); **multi-operator trust-minimizing client** (`client`); CPU
+batch-verify accelerator + gate + validator (+ CUDA backend behind a tag); **commercial
+HTTP/JSON server daemon** (`server`/`cmd/memserved`: health, metrics, rate limiting,
+timeouts, graceful shutdown, signed responses, admin, miner revenue). Reuses MF-SPV
+`commitment` + `crypto`. Tests run in CI under `-race` with no skips. See `SECURITY.md`.
+
+**Deployment steps (need live infra to finalize):** point `httpsource` at a real Teranode
+build (thin endpoint mapping), a live Aerospike cluster, and the GPU secp256k1 kernel
+behind the `cuda` boundary (validate with `accel.Validate`). The off-disk **archive** of
+pruned history is a separate, later project (§11.6).
+
+## 15. Abuse / DoS defenses (economics: the attacker loses money)
+
+Two griefing vectors and their defeat (`payment/abuse.go`, `server/limiter.go`):
+
+- **Channel-open flood → state exhaustion.** Channel state is allocated only against a
+  funded deposit ≥ `MinDeposit`, capped by `MaxChannels`. Opening N channels costs N
+  on-chain funded deposits (capital locked + miner fees); the operator is alerted.
+- **Invalid-commitment verify-flood (asymmetric secp256k1 cost).** Cheap O(1) checks
+  (amount/deposit/low-S) run BEFORE the expensive verify; a per-channel `MaxBadAttempts`
+  budget bans a flooding channel, bounding wasted work per funded deposit.
+- **Query flood.** Per-client token-bucket rate limiting + payment gating + shares-nothing
+  scale-out. MerklePath (CPU-bound) is priced higher.
+
+Net: every channel costs the attacker real on-chain capital; valid queries are prepaid (the
+operator profits); invalid floods are filtered, throttled, and cut. **The attack loses the
+attacker money and cannot drain the server.** The prepay model also protects clients: a
+client only pays what it signs (`client.SpendGuard` caps total spend).
+
+## 16. Trust model — verify, cross-check, and hold liars to account
+
+MemServe is an **untrusted cache**; correctness never depends on operator honesty:
+
+- **Inclusion is trustless.** `client.MultiClient.MerklePath/Mined` verify the returned
+  proof locally against the PoW header; one honest operator among many defeats all liars.
+- **Negative/state answers are cross-checked.** The client fans Seen/UTXO to multiple
+  independent operators and reports the answer with its agreement count (no single point of
+  trust).
+- **Lies are accountable.** Operators SIGN answers (`attest`); a signed false negative
+  refuted by a verifying proof, or an equivocation, is a publishable `FraudProof`. A miner
+  ENDORSES its operator's key, so the fraud proof names the miner too — if a miner lies via
+  its MemServe, it is provably held to account.
+
+## 17. Teranode integration & commercial server (miner value-add)
+
+- **Real ingest.** `teranode/httpsource` is an HTTP client to a Teranode asset/data server
+  implementing the same `teranode.Source` as the mock; the production and offline paths are
+  identical. Tested against a simulated Teranode; ingest re-validates every block.
+- **Commercial server.** `server` + `cmd/memserved`: zero-dep `net/http` JSON API for the
+  four queries + payment + admin, with health/readiness, Prometheus-style `/metrics`,
+  per-client rate limiting, request timeouts, structured logging, panic recovery, graceful
+  shutdown, and optional signed attestations on every answer.
+- **Miner value-add.** Run `memserved` as a sidecar to a miner's Teranode: it ingests the
+  miner's chain and **monetizes serving via payment channels** (`/admin/stats`
+  `revenueSatoshis`). The miner turns its block/UTXO data into a paid, accountable SPV
+  proof-and-status service — added value with bounded cost and built-in revenue.
 
 Build the skeleton above: the sharding+routing, the Aerospike store adapter, the
 Teranode ingest server, the MemServe query API, the **BSV pay-per-use payment channel**

@@ -203,6 +203,29 @@ func (s *Store) UnspendUTXO(op store.Outpoint) (bool, error) {
 	return true, nil
 }
 
+func (s *Store) DeleteUTXO(op store.Outpoint) (bool, error) {
+	u, ok, err := s.GetUTXO(op)
+	if err != nil {
+		return false, err
+	}
+	if ok && u.Spent {
+		_ = s.deindexSpent(op, u.SpentHeight)
+	}
+	k, err := s.key(setUTXO, outpointKey(op))
+	if err != nil {
+		return false, err
+	}
+	return s.client.Delete(s.wp, k)
+}
+
+func (s *Store) DeleteTxIndex(txid store.Hash) (bool, error) {
+	k, err := s.key(setTxIndex, txid[:])
+	if err != nil {
+		return false, err
+	}
+	return s.client.Delete(s.wp, k)
+}
+
 // spent-height index: one record per height, bin "ops" a list of outpoint keys.
 func (s *Store) indexSpent(op store.Outpoint, h uint32) error {
 	k, err := s.key(setSpentIdx, u32(h))
