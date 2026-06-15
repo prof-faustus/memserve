@@ -42,6 +42,8 @@ Docs: `DESIGN.md`, `SECURITY.md` (every audited attack vector → mitigation), `
 ## Remaining — live-infra only (each a scripted command on the target)
 
 - **BSV testnet**: broadcast channel txs to confirm consensus acceptance (DESIGN §10.6).
+  Tool built — `cmd/channeltestnet` (funding/settlement/refund, builds + signs + broadcasts);
+  runbook in `deploy/testnet/README.md`. Run on a networked box with faucet coins.
 - **Teranode**: set the two endpoint templates in `httpsource` to your node's paths; point `memserved -teranode`.
 - **Aerospike**: `make aerospike-up && make aerospike-test` against your cluster.
 - **GPU (3 cards)**: `bash deploy/gpu/setup.sh` — builds the multi-GPU kernel and validates it via `cmd/accelcheck`.
