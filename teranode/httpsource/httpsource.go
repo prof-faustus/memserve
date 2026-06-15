@@ -30,6 +30,17 @@ type Config struct {
 	EndHeight   uint32        // last height (0 = follow the tip indefinitely)
 	HTTPClient  *http.Client  // optional; a sane default is used if nil
 	PollEvery   time.Duration // how long to wait when caught up before re-checking tip
+
+	// Endpoint mapping (defaults model a Teranode asset server). BlockPathFmt must
+	// contain one %d for the height.
+	BestHeightPath string // default "/api/v1/bestheight"
+	BlockPathFmt   string // default "/api/v1/block/%d"
+
+	// Resilience / auth.
+	AuthBearer   string        // optional bearer token
+	MaxRetries   int           // transient-error retries per request (default 4)
+	RetryBackoff time.Duration // base backoff, exponential (default 200ms)
+	MaxBodyBytes int64         // response body cap (default 64 MiB)
 }
 
 // Source is a teranode.Source backed by a Teranode HTTP endpoint.
@@ -45,6 +56,21 @@ func New(cfg Config) *Source {
 	hc := cfg.HTTPClient
 	if hc == nil {
 		hc = &http.Client{Timeout: 30 * time.Second}
+	}
+	if cfg.BestHeightPath == "" {
+		cfg.BestHeightPath = "/api/v1/bestheight"
+	}
+	if cfg.BlockPathFmt == "" {
+		cfg.BlockPathFmt = "/api/v1/block/%d"
+	}
+	if cfg.MaxRetries <= 0 {
+		cfg.MaxRetries = 4
+	}
+	if cfg.RetryBackoff <= 0 {
+		cfg.RetryBackoff = 200 * time.Millisecond
+	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = 64 << 20
 	}
 	return &Source{cfg: cfg, hc: hc, height: cfg.StartHeight}
 }
@@ -106,7 +132,7 @@ func (s *Source) Next() (teranode.Block, bool, error) {
 
 func (s *Source) refreshTip() error {
 	var t jsonTip
-	if err := s.getJSON(fmt.Sprintf("%s/api/v1/bestheight", s.cfg.BaseURL), &t); err != nil {
+	if err := s.getJSON(s.cfg.BaseURL+s.cfg.BestHeightPath, &t); err != nil {
 		return err
 	}
 	s.tip = t.Height
@@ -115,23 +141,49 @@ func (s *Source) refreshTip() error {
 
 func (s *Source) fetchBlock(h uint32) (teranode.Block, error) {
 	var jb jsonBlock
-	if err := s.getJSON(fmt.Sprintf("%s/api/v1/block/%d", s.cfg.BaseURL, h), &jb); err != nil {
+	if err := s.getJSON(s.cfg.BaseURL+fmt.Sprintf(s.cfg.BlockPathFmt, h), &jb); err != nil {
 		return teranode.Block{}, err
 	}
 	return convert(jb)
 }
 
+// getJSON GETs url and decodes JSON, retrying transient failures (network errors, 429,
+// 5xx) with exponential backoff. 4xx (except 429) is a permanent error. The body is
+// capped at MaxBodyBytes.
 func (s *Source) getJSON(url string, dst any) error {
-	resp, err := s.hc.Get(url)
-	if err != nil {
-		return err
+	var lastErr error
+	backoff := s.cfg.RetryBackoff
+	for attempt := 0; attempt <= s.cfg.MaxRetries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+		req, err := http.NewRequest(http.MethodGet, url, nil)
+		if err != nil {
+			return err // malformed URL is permanent
+		}
+		if s.cfg.AuthBearer != "" {
+			req.Header.Set("Authorization", "Bearer "+s.cfg.AuthBearer)
+		}
+		resp, err := s.hc.Do(req)
+		if err != nil {
+			lastErr = err // network error: retry
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			err := json.NewDecoder(io.LimitReader(resp.Body, s.cfg.MaxBodyBytes)).Decode(dst)
+			resp.Body.Close()
+			return err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		lastErr = fmt.Errorf("httpsource: GET %s -> %d: %s", url, resp.StatusCode, string(body))
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			continue // transient: retry
+		}
+		return lastErr // permanent 4xx
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("httpsource: GET %s -> %d: %s", url, resp.StatusCode, string(b))
-	}
-	return json.NewDecoder(resp.Body).Decode(dst)
+	return fmt.Errorf("httpsource: exhausted %d retries: %w", s.cfg.MaxRetries, lastErr)
 }
 
 // --- conversion -------------------------------------------------------------

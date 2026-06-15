@@ -34,6 +34,7 @@ type Config struct {
 	RatePerSec      int            // per-client request rate (0 = unlimited)
 	RequestTimeout  time.Duration  // per-request timeout (default 15s)
 	PollEvery       time.Duration  // ingest poll interval when caught up (default 1s)
+	Store           store.Store    // backend; if nil, an in-memory store is used
 }
 
 // Server is a running MemServe shard service.
@@ -74,7 +75,10 @@ func New(cfg Config, src teranode.Source, log *slog.Logger) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	st := mem.New()
+	var st store.Store = cfg.Store
+	if st == nil {
+		st = mem.New()
+	}
 	pr := prune.New(st, cfg.Prune)
 	ing := ingest.New(st, pr, ingest.Config{K: cfg.ShardK, ID: cfg.ShardID})
 	apiSrv := api.New(st, cfg.Prune.D())

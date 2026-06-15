@@ -1,0 +1,23 @@
+# Local Aerospike for MemServe development / the aerospike conformance suite.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#   AEROSPIKE_HOST=127.0.0.1 AEROSPIKE_PORT=3000 AEROSPIKE_NAMESPACE=memserve \
+#     go test -tags aerospike ./store/aerospike/
+#   go run -tags aerospike ./cmd/memserved -mock -store aerospike \
+#     -aerospike-host 127.0.0.1 -aerospike-namespace memserve
+services:
+  aerospike:
+    image: aerospike/aerospike-server:7.1.0.0
+    container_name: memserve-aerospike
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+      - "3002:3002"
+    volumes:
+      - ./aerospike.conf:/etc/aerospike/aerospike.conf:ro
+    command: ["--config-file", "/etc/aerospike/aerospike.conf"]
+    healthcheck:
+      test: ["CMD", "asinfo", "-v", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

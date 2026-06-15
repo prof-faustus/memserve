@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"memserve/api"
 	"memserve/ingest"
@@ -132,6 +133,81 @@ func TestHTTPSourceIngestEndToEnd(t *testing.T) {
 	}
 	if hs.TipHeight() != 3 {
 		t.Fatalf("tip = %d, want 3", hs.TipHeight())
+	}
+}
+
+func TestHTTPSourceRetriesTransient(t *testing.T) {
+	src := teranode.NewMock(teranode.MockConfig{Blocks: 1, SubtreesPer: 1, TxsPerSubtree: 4})
+	b, _, _ := src.Next()
+	jb := toJSON(b)
+
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/bestheight", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]uint32{"height": 0})
+	})
+	mux.HandleFunc("/api/v1/block/", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 { // fail twice with 503, then succeed
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		}
+		json.NewEncoder(w).Encode(jb)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	hs := httpsource.New(httpsource.Config{BaseURL: ts.URL, StartHeight: 0, EndHeight: 0,
+		MaxRetries: 5, RetryBackoff: time.Millisecond})
+	blk, ok, err := hs.Next()
+	if err != nil || !ok {
+		t.Fatalf("retry path failed: ok=%v err=%v", ok, err)
+	}
+	if blk.Hash != b.Hash {
+		t.Fatal("wrong block after retries")
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 attempts (2 transient + success), got %d", calls)
+	}
+}
+
+func TestHTTPSourcePermanent4xxNoRetry(t *testing.T) {
+	var calls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/bestheight", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]uint32{"height": 0})
+	})
+	mux.HandleFunc("/api/v1/block/", func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	hs := httpsource.New(httpsource.Config{BaseURL: ts.URL, MaxRetries: 5, RetryBackoff: time.Millisecond})
+	if _, _, err := hs.Next(); err == nil {
+		t.Fatal("expected permanent 4xx error")
+	}
+	if calls != 1 {
+		t.Fatalf("4xx should not be retried, got %d calls", calls)
+	}
+}
+
+func TestHTTPSourceAuthHeader(t *testing.T) {
+	var gotAuth string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/bestheight", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]uint32{"height": 0})
+	})
+	mux.HandleFunc("/api/v1/block/", func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		http.Error(w, "no", http.StatusNotFound)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+	hs := httpsource.New(httpsource.Config{BaseURL: ts.URL, AuthBearer: "tok123"})
+	hs.Next() // triggers a bestheight fetch
+	if gotAuth != "Bearer tok123" {
+		t.Fatalf("auth header not sent: %q", gotAuth)
 	}
 }
 

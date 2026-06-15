@@ -395,10 +395,22 @@ HTTP/JSON server daemon** (`server`/`cmd/memserved`: health, metrics, rate limit
 timeouts, graceful shutdown, signed responses, admin, miner revenue). Reuses MF-SPV
 `commitment` + `crypto`. Tests run in CI under `-race` with no skips. See `SECURITY.md`.
 
-**Deployment steps (need live infra to finalize):** point `httpsource` at a real Teranode
-build (thin endpoint mapping), a live Aerospike cluster, and the GPU secp256k1 kernel
-behind the `cuda` boundary (validate with `accel.Validate`). The off-disk **archive** of
-pruned history is a separate, later project (§11.6).
+**Deployment fronts (built to the boundary; only the live-infra step remains):**
+
+- **Aerospike:** store is pluggable (`server.Config.Store`); the daemon selects it via
+  `-store aerospike` under `-tags aerospike`. A shared **conformance suite**
+  (`store/storetest`) runs against `mem` in CI and against a live cluster
+  (`make aerospike-up && make aerospike-test`, `deploy/docker-compose.yml`). Remaining:
+  run it against your production cluster.
+- **Teranode:** `teranode/httpsource` is production-hardened — configurable endpoint
+  templates, bearer auth, retries with exponential backoff, body caps — and tested vs a
+  simulated Teranode incl. transient-retry and permanent-4xx paths. Remaining: set the two
+  endpoint templates to your Teranode build's paths.
+- **GPU:** `cmd/accelcheck` runs the correctness gate + throughput on the active backend;
+  `make cuda` builds the kernel and `make cuda-check` validates it (`accel.Validate`) on a
+  GPU box. Remaining: compile/validate the kernel on NVIDIA hardware.
+
+The off-disk **archive** of pruned history is a separate, later project (§11.6).
 
 ## 15. Abuse / DoS defenses (economics: the attacker loses money)
 

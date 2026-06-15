@@ -52,6 +52,10 @@ func main() {
 	rate := flag.Int("rate", 0, "per-client requests/sec (0 = unlimited)")
 	minDeposit := flag.Uint64("min-deposit", 0, "minimum channel deposit (abuse defense)")
 	maxChannels := flag.Int("max-channels", 0, "max concurrent channels (0 = unlimited)")
+	storeKind := flag.String("store", "mem", "store backend: mem | aerospike (aerospike needs -tags aerospike)")
+	aeroHost := flag.String("aerospike-host", "127.0.0.1", "Aerospike host")
+	aeroPort := flag.Int("aerospike-port", 3000, "Aerospike port")
+	aeroNS := flag.String("aerospike-namespace", "memserve", "Aerospike namespace")
 	flag.Parse()
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -83,6 +87,12 @@ func main() {
 		os.Exit(2)
 	}
 
+	st, err := openStore(*storeKind, *aeroHost, *aeroPort, *aeroNS)
+	if err != nil {
+		log.Error("store init", "err", err)
+		os.Exit(2)
+	}
+
 	srv, err := server.New(server.Config{
 		ListenAddr:      *addr,
 		ShardK:          *shardK,
@@ -93,6 +103,7 @@ func main() {
 		OperatorSeed:    seed,
 		AdminToken:      *adminToken,
 		RatePerSec:      *rate,
+		Store:           st,
 	}, src, log)
 	if err != nil {
 		log.Error("server init", "err", err)

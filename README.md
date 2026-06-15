@@ -77,6 +77,19 @@ go run ./cmd/memserved -teranode http://teranode:8090 \
 # payment: /v1/channel/open /v1/quote /v1/paid/query ; admin: /admin/stats (Bearer token)
 ```
 
+### Deployment fronts (built to the boundary)
+
+```sh
+make aerospike-up && make aerospike-test   # local Aerospike + run the store conformance suite
+go run -tags aerospike ./cmd/memserved -mock -store aerospike -aerospike-host 127.0.0.1
+make accelcheck                            # validate the CPU verify backend vs the reference
+make cuda && make cuda-check               # build + validate the GPU kernel (needs nvcc + GPU)
+```
+
+Remaining live-infra steps: point `-teranode` at a real node (two endpoint templates),
+run the conformance suite against your Aerospike cluster, and validate the CUDA kernel on
+a GPU. Everything else is built and tested.
+
 ## Build / test / run
 
 ```sh
