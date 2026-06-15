@@ -336,6 +336,26 @@ decision **unless we also prune them** on their own depth/retention policy (§11
 > separate **off-disk archive** that captures pruned (deep-spent) history before/at
 > eviction, so MemServe stays lean in memory while a cold store retains full history.
 
+### 11.7 Index/proof retention — bounding the store by design
+
+Spend-depth pruning (above) only evicts *spent UTXOs*. The **TxIndex, subtree, block and
+header** records would otherwise grow with chain history forever — an unbounded in-memory
+footprint (this is what caused a memory runaway in a long mock ingest). **`IndexRetention`**
+(blocks) bounds them: on each new block, all index/proof data for heights buried deeper
+than `IndexRetention` is freed (`PruneIndexAtHeight`, gap-safe like the spend sweep, via a
+per-height index in the store).
+
+- **Steady state** then holds ~`IndexRetention` blocks of index data, regardless of how
+  long the node runs (measured: 200 blocks ingested, txindex pinned at `IndexRetention`×
+  txs/block).
+- **Honest semantics:** a tx older than the window answers **"not in retained window"** /
+  not-found for Seen/Mined/MerklePath — the deliberate serving-window choice (§11.5). A
+  client needing deeper data queries a larger-window or archival node.
+- **Default off** (`0` = keep all) because it changes answers for old txs; set it (via
+  `memserved -index-retention`, recommended `>= D`) to bound the in-memory store, or use
+  the disk-backed **Aerospike** backend for full retention. The `-max-mem-mb` watchdog +
+  `debug.SetMemoryLimit` backstop remain as host-safety nets regardless.
+
 ## 12. Proposed project structure (skeleton only — to build after you confirm)
 
 ```

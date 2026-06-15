@@ -32,6 +32,13 @@ type Policy struct {
 	ReorgHorizon uint32
 	// RecencyWindow is extra spent-query retention on top of the floor (>= 0).
 	RecencyWindow uint32
+	// IndexRetention bounds the STORE BY DESIGN (§11.7): block/subtree/tx-index/header
+	// data is freed once buried deeper than this many blocks. 0 = keep all (unbounded;
+	// rely on a disk backend or the memory watchdog). Setting it makes Seen/Mined/
+	// MerklePath answer "not in retained window" for txs older than the window — a
+	// deliberate serving-window choice. Recommended >= D() so it never prunes index data
+	// the spend window still needs.
+	IndexRetention uint32
 }
 
 // D returns the effective prune depth: spends are evicted once buried deeper than D.
@@ -81,33 +88,52 @@ func (pr *Pruner) TotalPruned() uint64 { return atomic.LoadUint64(&pr.total) }
 // never freed while a tolerated reorg could still roll it back (§11.2). It only ever
 // under-/correctly-prunes, never inside the horizon.
 func (pr *Pruner) OnNewBlock(tip uint32) (int, error) {
-	d := pr.policy.D()
 	prevTip, hadTip := pr.lastTip, pr.hasTip
 	pr.lastTip, pr.hasTip = tip, true
-	if tip < d {
-		return 0, nil // chain not yet D deep; nothing has crossed the cutoff
-	}
-	target := tip - d // highest band that has now reached depth d+1
 
-	// Lowest band not yet pruned.
+	total := 0
+	// UTXO spend-depth eviction at depth D.
+	n, err := pr.sweep(prevTip, hadTip, tip, pr.policy.D(), pr.st.PruneSpentAtHeight)
+	total += n
+	if err != nil {
+		atomic.AddUint64(&pr.total, uint64(total))
+		return total, err
+	}
+	// Index/proof data retention at depth IndexRetention (0 = keep all).
+	if pr.policy.IndexRetention > 0 {
+		ni, err := pr.sweep(prevTip, hadTip, tip, pr.policy.IndexRetention, pr.st.PruneIndexAtHeight)
+		total += ni
+		if err != nil {
+			atomic.AddUint64(&pr.total, uint64(total))
+			return total, err
+		}
+	}
+	atomic.AddUint64(&pr.total, uint64(total))
+	return total, nil
+}
+
+// sweep evicts every band in (prevTip-d, tip-d] via fn — the gap-safe range that has
+// reached depth > d since the last call (so tip jumps never leak). Returns records freed.
+func (pr *Pruner) sweep(prevTip uint32, hadTip bool, tip, d uint32, fn func(uint32) (int, error)) (int, error) {
+	if tip < d {
+		return 0, nil // nothing has reached depth d+1 yet
+	}
+	target := tip - d
 	var start uint32
 	switch {
 	case !hadTip:
-		// First call: establish a baseline at the current band. We do not backfill
-		// ancient history below the point ingestion began (no records exist there).
-		start = target
+		start = target // first call: baseline, no ancient backfill
 	case prevTip >= d:
-		start = (prevTip - d) + 1 // first band after the one the previous call reached
+		start = (prevTip - d) + 1
 	default:
-		start = 0 // previously below depth D; nothing pruned yet, sweep from 0
+		start = 0
 	}
 	if start > target {
 		return 0, nil
 	}
-
 	total := 0
 	for h := start; ; h++ {
-		n, err := pr.st.PruneSpentAtHeight(h)
+		n, err := fn(h)
 		if err != nil {
 			return total, err
 		}
@@ -116,7 +142,6 @@ func (pr *Pruner) OnNewBlock(tip uint32) (int, error) {
 			break
 		}
 	}
-	atomic.AddUint64(&pr.total, uint64(total))
 	return total, nil
 }
 

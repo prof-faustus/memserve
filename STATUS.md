@@ -50,18 +50,20 @@ Docs: `DESIGN.md`, `SECURITY.md` (every audited attack vector → mitigation), `
 
 ## Memory bounding (important)
 
-The in-memory store grows with chain history (TxIndex / subtree / block maps are not
-depth-pruned — only spent UTXOs are). To stop a long/looping ingest from consuming the
-host, `memserved` has:
+Three layers keep the store bounded:
 
-- `-max-mem-mb` (default 4096): a watchdog that **pauses ingestion** when the process heap
-  exceeds it (no block dropped; the store keeps serving). `/metrics` exposes
-  `memserve_heap_bytes` and `memserve_max_mem_mb`.
-- `-mock-blocks` (default 300): the mock source ingests a bounded number of blocks, then
-  stops growing (the old default ran unbounded and could exhaust RAM).
+- `-index-retention <blocks>` (default 0 = off): **bounds the store by design** — frees
+  TxIndex/subtree/block/header data deeper than the window each block (DESIGN §11.7).
+  Verified: 200 blocks ingested, txindex pinned to the retention window (not 200 blocks'
+  worth). Set it `>= reorg-horizon+recency`. Old txs then answer "not in retained window".
+- `-max-mem-mb` (default 4096): watchdog that **pauses ingestion** when the heap exceeds it
+  (no block dropped; keeps serving). `/metrics` exposes `memserve_heap_bytes` / `memserve_max_mem_mb`.
+- `debug.SetMemoryLimit` backstop (~1.25× the watchdog): the Go runtime GCs harder / returns
+  memory to the OS so a single step can never take the host down.
+- `-mock-blocks` (default 300): the mock source stops growing after N blocks (the old
+  default ran unbounded and caused a RAM runaway).
 
-For unbounded production retention use the **Aerospike** backend (`-store aerospike`,
-disk-backed) rather than the in-memory store, and/or set `-max-mem-mb` to ~75% of box RAM.
+For full production retention use the disk-backed **Aerospike** backend (`-store aerospike`).
 
 ## Run
 

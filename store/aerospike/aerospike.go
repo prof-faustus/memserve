@@ -24,12 +24,13 @@ import (
 
 // Set (table) names.
 const (
-	setTxIndex  = "txindex"
-	setUTXO     = "utxo"
-	setSubtree  = "subtree"
-	setBlock    = "block"
-	setHeader   = "header"
-	setSpentIdx = "spentidx"
+	setTxIndex   = "txindex"
+	setUTXO      = "utxo"
+	setSubtree   = "subtree"
+	setBlock     = "block"
+	setHeader    = "header"
+	setSpentIdx  = "spentidx"
+	setHeightIdx = "heightidx"
 )
 
 // Store implements store.Store over an Aerospike namespace.
@@ -96,11 +97,17 @@ func (s *Store) PutTxIndex(txid store.Hash, ix store.TxIndex) error {
 	if ix.Mined {
 		mined = 1
 	}
-	return s.client.Put(s.wp, k, aero.BinMap{
+	if err := s.client.Put(s.wp, k, aero.BinMap{
 		"mined": mined, "bh": ix.BlockHash[:], "ht": int(ix.Height),
 		"bt": int(ix.BlockTime), "si": int(ix.SubtreeIndex), "li": int(ix.LeafIndex),
 		"sn": ix.SeenTime,
-	})
+	}); err != nil {
+		return err
+	}
+	if ix.Mined {
+		return s.indexHeightTx(ix.Height, txid)
+	}
+	return nil
 }
 
 func (s *Store) GetTxIndex(txid store.Hash) (store.TxIndex, bool, error) {
@@ -303,10 +310,76 @@ func (s *Store) PutBlock(b store.BlockRec) error {
 	if err != nil {
 		return err
 	}
-	return s.client.Put(s.wp, k, aero.BinMap{
+	if err := s.client.Put(s.wp, k, aero.BinMap{
 		"ht": int(b.Height), "bt": int(b.Time), "mr": b.MerkleRoot[:],
 		"sr": packHashes(b.SubtreeRoots), "hdr": b.Header[:],
-	})
+	}); err != nil {
+		return err
+	}
+	return s.indexHeightBlock(b)
+}
+
+// indexHeightBlock records this block + its subtree roots under its height (for depth
+// retention, §11.7).
+func (s *Store) indexHeightBlock(b store.BlockRec) error {
+	k, err := s.key(setHeightIdx, u32(b.Height))
+	if err != nil {
+		return err
+	}
+	return s.client.Put(s.wp, k, aero.BinMap{"blk": b.Hash[:], "subs": packHashes(b.SubtreeRoots)})
+}
+
+// indexHeightTx appends a txid to the height-index record for its height.
+func (s *Store) indexHeightTx(height uint32, txid store.Hash) error {
+	k, err := s.key(setHeightIdx, u32(height))
+	if err != nil {
+		return err
+	}
+	_, err = s.client.Operate(s.wp, k, aero.ListAppendOp("txids", txid[:]))
+	return err
+}
+
+// PruneIndexAtHeight removes the block, subtrees, tx-index entries and header at height h.
+func (s *Store) PruneIndexAtHeight(h uint32) (int, error) {
+	k, err := s.key(setHeightIdx, u32(h))
+	if err != nil {
+		return 0, err
+	}
+	rec, err := s.client.Get(s.rp, k)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	del := func(set string, keyBytes []byte) {
+		dk, e := s.key(set, keyBytes)
+		if e != nil {
+			return
+		}
+		if ok, _ := s.client.Delete(s.wp, dk); ok {
+			n++
+		}
+	}
+	if rec != nil {
+		if blk := toBytes(rec.Bins["blk"]); len(blk) == 32 {
+			del(setBlock, blk)
+		}
+		for _, r := range unpackHashes(toBytes(rec.Bins["subs"])) {
+			rr := r
+			del(setSubtree, rr[:])
+		}
+		if list, ok := rec.Bins["txids"].([]interface{}); ok {
+			for _, v := range list {
+				if tb := toBytes(v); len(tb) == 32 {
+					del(setTxIndex, tb)
+				}
+			}
+		}
+	}
+	del(setHeader, u32(h))
+	if rec != nil {
+		_, _ = s.client.Delete(s.wp, k)
+	}
+	return n, nil
 }
 
 func (s *Store) GetBlock(hash store.Hash) (store.BlockRec, bool, error) {

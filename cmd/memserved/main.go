@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -54,11 +55,22 @@ func main() {
 	maxChannels := flag.Int("max-channels", 0, "max concurrent channels (0 = unlimited)")
 	maxMemMB := flag.Int("max-mem-mb", 4096, "pause ingestion when the heap exceeds this many MB (0 = unlimited)")
 	mockBlocks := flag.Int("mock-blocks", 300, "mock source: number of blocks to ingest then stop growing")
+	indexRetention := flag.Uint("index-retention", 0, "bound the store by design: free block/subtree/txindex/header data deeper than this many blocks (0 = keep all; recommended >= reorg-horizon+recency). Setting it makes old txs answer 'not in retained window'.")
 	storeKind := flag.String("store", "mem", "store backend: mem | aerospike (aerospike needs -tags aerospike)")
 	aeroHost := flag.String("aerospike-host", "127.0.0.1", "Aerospike host")
 	aeroPort := flag.Int("aerospike-port", 3000, "Aerospike port")
 	aeroNS := flag.String("aerospike-namespace", "memserve", "Aerospike namespace")
 	flag.Parse()
+
+	// Hard backstop against runaway memory: cap the Go runtime's total memory so a
+	// looping or unbounded ingest can never take the host down — the runtime GCs harder
+	// and returns memory to the OS to stay under the limit. The ingest watchdog
+	// (-max-mem-mb) pauses fetching first; this floor holds even if a single step
+	// outpaces it. Set ~25% above the watchdog so the watchdog acts before the runtime
+	// has to spend itself on GC.
+	if *maxMemMB > 0 {
+		debug.SetMemoryLimit((int64(*maxMemMB) * 5 / 4) << 20)
+	}
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -87,6 +99,11 @@ func main() {
 	if err != nil {
 		log.Error("invalid prune policy", "err", err)
 		os.Exit(2)
+	}
+	pol.IndexRetention = uint32(*indexRetention)
+	if pol.IndexRetention != 0 && pol.IndexRetention < pol.D() {
+		log.Warn("index-retention below spend-depth D; recommend index-retention >= D",
+			"indexRetention", pol.IndexRetention, "D", pol.D())
 	}
 
 	st, err := openStore(*storeKind, *aeroHost, *aeroPort, *aeroNS)

@@ -92,5 +92,12 @@ type Store interface {
 	// evicted. The pruner calls this for the single band that just crossed depth D.
 	PruneSpentAtHeight(h uint32) (int, error)
 
+	// PruneIndexAtHeight removes all index/proof data for block height h — the block
+	// record, its subtree leaves, its tx-index entries, and the header — so the store is
+	// bounded by an index-retention depth (DESIGN.md §11.7), not just by spent-UTXO depth.
+	// Returns the number of records freed. After this, Seen/Mined/MerklePath for txs at
+	// height h answer "not in retained window" (honest §11.5 semantics).
+	PruneIndexAtHeight(h uint32) (int, error)
+
 	Stats() Stats
 }

@@ -39,16 +39,27 @@ func newStripe() *stripe {
 	}
 }
 
+// heightEntry indexes the records stored for one block height, so they can be pruned by
+// depth (DESIGN.md §11.7). Populated on ingest (PutBlock/PutTxIndex).
+type heightEntry struct {
+	block    store.Hash
+	hasBlock bool
+	subtrees []store.Hash
+	txids    []store.Hash
+}
+
 // Store is a striped in-memory store.Store.
 type Store struct {
-	st  [stripeCount]*stripe
-	hmu sync.RWMutex
-	hdr map[uint32][80]byte // headers (one per block; kept in a single small map)
+	st   [stripeCount]*stripe
+	hmu  sync.RWMutex
+	hdr  map[uint32][80]byte // headers (one per block; kept in a single small map)
+	imu  sync.Mutex
+	hidx map[uint32]*heightEntry // height -> the records stored for it (for depth retention)
 }
 
 // New returns an empty in-memory store.
 func New() *Store {
-	s := &Store{hdr: make(map[uint32][80]byte)}
+	s := &Store{hdr: make(map[uint32][80]byte), hidx: make(map[uint32]*heightEntry)}
 	for i := range s.st {
 		s.st[i] = newStripe()
 	}
@@ -62,8 +73,19 @@ func striperOf(h store.Hash) int { return int(h[0]) }
 func (s *Store) PutTxIndex(txid store.Hash, ix store.TxIndex) error {
 	st := s.st[striperOf(txid)]
 	st.mu.Lock()
+	_, existed := st.txindex[txid]
 	st.txindex[txid] = ix
 	st.mu.Unlock()
+	if ix.Mined && !existed {
+		s.imu.Lock()
+		e := s.hidx[ix.Height]
+		if e == nil {
+			e = &heightEntry{}
+			s.hidx[ix.Height] = e
+		}
+		e.txids = append(e.txids, txid)
+		s.imu.Unlock()
+	}
 	return nil
 }
 
@@ -195,6 +217,15 @@ func (s *Store) PutBlock(b store.BlockRec) error {
 	st.mu.Lock()
 	st.blocks[b.Hash] = b
 	st.mu.Unlock()
+	s.imu.Lock()
+	e := s.hidx[b.Height]
+	if e == nil {
+		e = &heightEntry{}
+		s.hidx[b.Height] = e
+	}
+	e.block, e.hasBlock = b.Hash, true
+	e.subtrees = append([]store.Hash(nil), b.SubtreeRoots...)
+	s.imu.Unlock()
 	return nil
 }
 
@@ -237,6 +268,53 @@ func (s *Store) PruneSpentAtHeight(h uint32) (int, error) {
 		}
 		st.mu.Unlock()
 	}
+	return n, nil
+}
+
+// PruneIndexAtHeight removes the block, subtrees, tx-index entries and header recorded at
+// height h (depth-retention of index/proof data, §11.7). Returns records freed.
+func (s *Store) PruneIndexAtHeight(h uint32) (int, error) {
+	s.imu.Lock()
+	e := s.hidx[h]
+	delete(s.hidx, h)
+	s.imu.Unlock()
+
+	n := 0
+	if e != nil {
+		if e.hasBlock {
+			st := s.st[striperOf(e.block)]
+			st.mu.Lock()
+			if _, ok := st.blocks[e.block]; ok {
+				delete(st.blocks, e.block)
+				n++
+			}
+			st.mu.Unlock()
+		}
+		for _, r := range e.subtrees {
+			st := s.st[striperOf(r)]
+			st.mu.Lock()
+			if _, ok := st.subtree[r]; ok {
+				delete(st.subtree, r)
+				n++
+			}
+			st.mu.Unlock()
+		}
+		for _, id := range e.txids {
+			st := s.st[striperOf(id)]
+			st.mu.Lock()
+			if _, ok := st.txindex[id]; ok {
+				delete(st.txindex, id)
+				n++
+			}
+			st.mu.Unlock()
+		}
+	}
+	s.hmu.Lock()
+	if _, ok := s.hdr[h]; ok {
+		delete(s.hdr, h)
+		n++
+	}
+	s.hmu.Unlock()
 	return n, nil
 }
 

@@ -125,6 +125,61 @@ func TestOnNewBlockBackfillsTipJump(t *testing.T) {
 	}
 }
 
+func TestIndexRetentionSweep(t *testing.T) {
+	st := mem.New()
+	// a block at height 100 with a subtree, two txs and a header.
+	root := commitment.DoubleSHA256([]byte("subroot"))
+	st.PutSubtree(root, []store.Hash{commitment.DoubleSHA256([]byte("t1"))})
+	st.PutBlock(store.BlockRec{Hash: commitment.DoubleSHA256([]byte("blk100")), Height: 100, SubtreeRoots: []store.Hash{root}})
+	st.PutHeader(100, [80]byte{})
+	st.PutTxIndex(commitment.DoubleSHA256([]byte("t1")), store.TxIndex{Mined: true, Height: 100})
+
+	pr := New(st, Policy{ReorgHorizon: 6, RecencyWindow: 0, IndexRetention: 10})
+	// below index depth: nothing pruned.
+	for tip := uint32(100); tip <= 109; tip++ {
+		pr.OnNewBlock(tip)
+	}
+	if _, ok, _ := st.GetBlock(commitment.DoubleSHA256([]byte("blk100"))); !ok {
+		t.Fatal("block index pruned within retention window")
+	}
+	// tip 110: depth of height-100 data = 11 > 10 -> pruned.
+	pr.OnNewBlock(110)
+	if _, ok, _ := st.GetBlock(commitment.DoubleSHA256([]byte("blk100"))); ok {
+		t.Fatal("block index NOT pruned past retention depth")
+	}
+	if _, ok, _ := st.GetTxIndex(commitment.DoubleSHA256([]byte("t1"))); ok {
+		t.Fatal("txindex NOT pruned past retention depth")
+	}
+	if _, ok, _ := st.GetSubtree(root); ok {
+		t.Fatal("subtree NOT pruned past retention depth")
+	}
+}
+
+func TestIndexRetentionBoundsStoreDuringIngest(t *testing.T) {
+	// With IndexRetention set, txindex/blocks stay bounded over a long ingest instead of
+	// growing forever (the memory-runaway fix, by design).
+	st := mem.New()
+	pol := Policy{ReorgHorizon: 4, RecencyWindow: 0, IndexRetention: 8}
+	pr := New(st, pol)
+	for h := uint32(1); h <= 200; h++ {
+		st.PutBlock(store.BlockRec{Hash: commitment.DoubleSHA256([]byte{byte(h), byte(h >> 8)}), Height: h, SubtreeRoots: []store.Hash{}})
+		st.PutHeader(h, [80]byte{})
+		for i := 0; i < 16; i++ {
+			id := commitment.DoubleSHA256([]byte{byte(h), byte(h >> 8), byte(i), 0x7a})
+			st.PutTxIndex(id, store.TxIndex{Mined: true, Height: h})
+		}
+		pr.OnNewBlock(h)
+	}
+	s := st.Stats()
+	// retained ~ IndexRetention blocks worth, NOT all 200 (which would be 3200 txindex).
+	if s.TxIndex > 16*int(pol.IndexRetention+4) {
+		t.Fatalf("txindex not bounded by retention: %d", s.TxIndex)
+	}
+	if s.Blocks > int(pol.IndexRetention+4) {
+		t.Fatalf("blocks not bounded by retention: %d", s.Blocks)
+	}
+}
+
 func TestDepth(t *testing.T) {
 	if d := Depth(110, 100); d != 11 {
 		t.Fatalf("Depth(110,100)=%d want 11", d)

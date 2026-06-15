@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
@@ -210,22 +211,37 @@ func (s *Server) IngestOnce() error {
 
 func (s *Server) ingestLoop(ctx context.Context) {
 	var lastWarn time.Time
+	var paused bool
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		// Memory watchdog: if the heap exceeds MaxMemMB, PAUSE ingestion (do not fetch
+		// Memory watchdog: if memory exceeds MaxMemMB, PAUSE ingestion (do not fetch
 		// the next block) until memory frees. This stops unbounded growth from taking the
 		// host down; no block is dropped (we just don't advance). The store keeps serving.
 		if s.cfg.MaxMemMB > 0 {
 			var ms runtime.MemStats
 			runtime.ReadMemStats(&ms)
-			if int(ms.HeapAlloc/(1<<20)) >= s.cfg.MaxMemMB {
+			// Gate on memory actually held from the OS (in-use heap + stacks), NOT
+			// HeapAlloc. HeapAlloc collapses to the live set after every GC, so a burst
+			// of short-lived ingest garbage can drive the process's real footprint (and
+			// committed pages) far past the limit while HeapAlloc still reads low — that
+			// is how a runaway ingest slipped past this watchdog and exhausted host RAM.
+			// HeapInuse/StackInuse track the high-water span usage the OS actually sees.
+			heldMB := int((ms.HeapInuse + ms.StackInuse) / (1 << 20))
+			if heldMB >= s.cfg.MaxMemMB {
+				if !paused {
+					paused = true
+					// Hand retained-but-free spans back to the OS on entering the pause,
+					// so the process's committed footprint actually drops instead of
+					// leaving cold pages for the OS to thrash out to the pagefile.
+					debug.FreeOSMemory()
+				}
 				if time.Since(lastWarn) > 30*time.Second {
-					s.log.Warn("ingest paused: heap at memory limit",
-						"heapMB", ms.HeapAlloc/(1<<20), "maxMemMB", s.cfg.MaxMemMB, "tip", s.tip.Load())
+					s.log.Warn("ingest paused: at memory limit",
+						"heldMB", heldMB, "maxMemMB", s.cfg.MaxMemMB, "tip", s.tip.Load())
 					lastWarn = time.Now()
 				}
 				s.ready.Store(true)
@@ -236,6 +252,7 @@ func (s *Server) ingestLoop(ctx context.Context) {
 				}
 				continue
 			}
+			paused = false
 		}
 		b, ok, err := s.src.Next()
 		if err != nil {

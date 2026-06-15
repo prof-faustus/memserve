@@ -20,6 +20,44 @@ func RunSuite(t *testing.T, newStore func() store.Store) {
 	t.Run("Prune", func(t *testing.T) { testPrune(t, newStore()) })
 	t.Run("RollbackDeletes", func(t *testing.T) { testDeletes(t, newStore()) })
 	t.Run("SubtreeBlockHeader", func(t *testing.T) { testSubtreeBlockHeader(t, newStore()) })
+	t.Run("PruneIndexAtHeight", func(t *testing.T) { testPruneIndex(t, newStore()) })
+}
+
+func testPruneIndex(t *testing.T, s store.Store) {
+	root := h(70)
+	s.PutSubtree(root, []store.Hash{h(71), h(72)})
+	s.PutBlock(store.BlockRec{Hash: h(73), Height: 7, MerkleRoot: h(74), SubtreeRoots: []store.Hash{root}})
+	var hdr [80]byte
+	s.PutHeader(7, hdr)
+	s.PutTxIndex(h(71), store.TxIndex{Mined: true, Height: 7, BlockHash: h(73)})
+	s.PutTxIndex(h(72), store.TxIndex{Mined: true, Height: 7, BlockHash: h(73)})
+	// an unrelated block at height 8 must survive.
+	s.PutBlock(store.BlockRec{Hash: h(80), Height: 8, SubtreeRoots: []store.Hash{}})
+	s.PutTxIndex(h(81), store.TxIndex{Mined: true, Height: 8, BlockHash: h(80)})
+
+	n, err := s.PruneIndexAtHeight(7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 { // block + subtree + 2 txindex + header
+		t.Fatalf("PruneIndexAtHeight freed %d records, want 5", n)
+	}
+	if _, ok, _ := s.GetBlock(h(73)); ok {
+		t.Fatal("block survived index prune")
+	}
+	if _, ok, _ := s.GetSubtree(root); ok {
+		t.Fatal("subtree survived index prune")
+	}
+	if _, ok, _ := s.GetTxIndex(h(71)); ok {
+		t.Fatal("txindex survived index prune")
+	}
+	if _, ok, _ := s.GetHeader(7); ok {
+		t.Fatal("header survived index prune")
+	}
+	// height 8 data is untouched.
+	if _, ok, _ := s.GetTxIndex(h(81)); !ok {
+		t.Fatal("unrelated height pruned")
+	}
 }
 
 func testTxIndex(t *testing.T, s store.Store) {

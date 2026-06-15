@@ -1,6 +1,6 @@
 # MemServe — build, test, run. BSV/Teranode only.
 
-.PHONY: all build test race vet fmt fmtcheck demo ingest serve aerospike aerospike-up aerospike-test accelcheck cuda cuda-check clean
+.PHONY: all build test race vet fmt fmtcheck demo ingest serve smoke aerospike aerospike-up aerospike-test accelcheck cuda cuda-check clean
 
 all: fmtcheck vet build test
 
@@ -34,6 +34,11 @@ ingest:
 # Run the production daemon against the built-in mock source.
 serve:
 	go run ./cmd/memserved -mock -addr :8080
+
+# Build, boot against the mock source, probe health/metrics, then shut down cleanly.
+# Captures the server's real pid and traps cleanup so it can never be orphaned.
+smoke:
+	bash scripts/smoke.sh
 
 # Compile the Aerospike-backed store adapter (requires the client library).
 aerospike:
