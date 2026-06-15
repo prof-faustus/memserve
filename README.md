@@ -10,8 +10,11 @@ side** — *serving* the Merkle proof and answering *"is this tx mined?"* MemSer
 into a distributed **O(1) in-memory key lookup** backed by Aerospike, pulling its data from
 Teranode.
 
-> **Status: design / understanding phase.** See [`DESIGN.md`](./DESIGN.md) for the full
-> write-up. No application code yet — building begins on confirmation.
+> **Status: implemented (v0).** The full pipeline is built, tested, and benchmarkable
+> offline against a deterministic mock Teranode source. See [`DESIGN.md`](./DESIGN.md)
+> for the design rationale. The real Teranode ingest adapter and a live Aerospike
+> cluster are the deployment steps; the Aerospike-backed store is implemented behind the
+> `aerospike` build tag.
 
 ## What it answers
 
@@ -38,6 +41,40 @@ For a `txid` (and optionally `outpoint = txid:vout`):
 - **Spend-depth pruning.** Not an archive: once a spend is buried **D blocks deep** (a
   per-server policy, e.g. "run 10 deep") the record is **pruned and freed**. Live (unspent)
   outputs are never pruned. Bounds memory to the live set + recent spends. See `DESIGN.md §11`.
+
+## Layout
+
+```
+cmd/memserve   demo + benchmark (ingest -> serve -> verify -> pay -> shard extrapolation)
+cmd/ingest     the run server: pulls a (mock) Teranode source, drives spend-depth pruning
+shard/         hash-prefix sharding + stateless routing (k bits -> 2^k shards)
+store/         Store interface + records; store/mem (striped, default), store/aerospike (tag)
+teranode/      read-only ingest source + deterministic Merkle-consistent mock
+ingest/        indexes blocks into a shard's store, owns only its prefix
+proof/         Merkle-path assembly + verification (reuses the commitment fold)
+api/           Seen / Mined / MerklePath / UTXO, with honest post-prune semantics
+prune/         spend-depth retention with the named reorg-horizon correctness floor
+payment/       pay-per-use BSV channel (prepay-then-serve) + payment-gated server
+commitment/    SHA-256d Merkle core (vendored from MF-SPV)
+crypto/        secp256k1 ECDSA, RFC 6979, low-S, constant-time scalar mult (vendored from MF-SPV)
+```
+
+## Build / test / run
+
+```sh
+make            # fmtcheck + vet + build + test
+make race       # tests under the race detector
+make demo       # cmd/memserve: end-to-end + throughput + shard extrapolation
+make ingest     # cmd/ingest: spend-depth pruning bounding memory as the chain grows
+make aerospike  # compile the Aerospike-backed store (pulls the client library)
+```
+
+Measured on a 64-core box (`go run ./cmd/memserve`): in-memory lookups scale across cores
+(Seen/Mined ~1.8×10⁸ answers/s, UTXO ~1.4×10⁸; the store is internally striped by hash
+prefix so it does not serialize on one lock). MerklePath is CPU-bound (the path is rebuilt
+on read — the honest pull cost). The paid path is bound by secp256k1 verification (the true
+cost of metered access, reported, not hidden). Aggregate scales shares-nothing as
+per-shard × 2ᵏ shards.
 
 ## License
 

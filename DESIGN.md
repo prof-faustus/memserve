@@ -1,8 +1,10 @@
 # MemServe — an in-memory, hash-sharded transaction-lookup fabric over Teranode
 
-**Status: DESIGN / understanding write-up for confirmation. No code yet.** This file
-records my understanding of the system you described so you can check it is correct
-and hand it to Claude for full write-ups before any building begins.
+**Status: IMPLEMENTED (v0).** This file records the design; the system is now built and
+tested (see the repository packages and `README.md`). The mock Teranode source makes the
+whole pipeline runnable offline; the real Teranode adapter and a live Aerospike cluster
+are the deployment steps. The numbered "Decisions (resolved)" sections below reflect the
+choices that were confirmed and implemented.
 
 ---
 
