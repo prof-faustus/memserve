@@ -218,7 +218,7 @@ func (s *Store) deindexSpent(op store.Outpoint, h uint32) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.client.Operate(s.wp, k, aero.ListRemoveByValueOp("ops", outpointKey(op), false))
+	_, err = s.client.Operate(s.wp, k, aero.ListRemoveByValueOp("ops", outpointKey(op), aero.ListReturnTypeNone))
 	return err
 }
 
