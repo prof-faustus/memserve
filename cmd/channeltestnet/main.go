@@ -29,6 +29,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"memserve/bsvtx"
@@ -52,6 +53,9 @@ func main() {
 	pay := flag.Uint64("pay", 0, "settle: cumulative sats to pay the server")
 	lockTime := flag.Uint("locktime", 0, "refund nLockTime (block height or unix time)")
 	api := flag.String("api", "https://api.whatsonchain.com/v1/bsv/test/tx/raw", "broadcast endpoint")
+	utxoAPI := flag.String("utxo-api", "https://api.whatsonchain.com/v1/bsv/test/address", "address base for UTXO lookup ({base}/{addr}/unspent)")
+	statusAPI := flag.String("status-api", "https://api.whatsonchain.com/v1/bsv/test/tx/hash", "tx-status base ({base}/{txid})")
+	statusTxid := flag.String("txid", "", "status: tx id to check confirmations for")
 	broadcast := flag.Bool("broadcast", false, "POST the tx to -api")
 	flag.Parse()
 
@@ -79,12 +83,49 @@ func main() {
 		fmt.Printf("client pub: %s\n", hex.EncodeToString(clientPub))
 		fmt.Printf("server pub: %s\n", hex.EncodeToString(serverPub))
 		fmt.Printf("server seed (keep): %s\n", srvSeed)
-	case "fund":
-		if *deposit == 0 || *utxoTxid == "" || *utxoValue == 0 {
-			fmt.Println("error: fund needs -utxo-txid -utxo-vout -utxo-value -deposit")
+	case "utxo":
+		addr := bsvtx.AddressFromPubKey(clientPub, ver)
+		us, err := fetchUTXOs(*utxoAPI, addr)
+		if err != nil {
+			fmt.Println("utxo fetch failed:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("UTXOs for %s (%d):\n", addr, len(us))
+		for _, u := range us {
+			fmt.Printf("  %s:%d  %d sats  (height %d)\n", u.TxID, u.Vout, u.Value, u.Height)
+		}
+	case "status":
+		if *statusTxid == "" {
+			fmt.Println("error: status needs -txid")
 			os.Exit(2)
 		}
-		tx := buildFunding(clientPriv, clientPub, serverPub, *utxoTxid, uint32(*utxoVout), *utxoValue, *deposit, *fee)
+		conf, height, err := fetchStatus(*statusAPI, *statusTxid)
+		if err != nil {
+			fmt.Println("status fetch failed:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("tx %s: confirmations=%d blockHeight=%d\n", *statusTxid, conf, height)
+	case "fund":
+		if *deposit == 0 {
+			fmt.Println("error: fund needs -deposit")
+			os.Exit(2)
+		}
+		uTxid, uVout, uValue := *utxoTxid, uint32(*utxoVout), *utxoValue
+		if uTxid == "" { // auto-discover the funding UTXO from the explorer
+			addr := bsvtx.AddressFromPubKey(clientPub, ver)
+			best, err := pickUTXO(*utxoAPI, addr, *deposit+*fee)
+			if err != nil {
+				fmt.Printf("auto-fetch UTXO for %s failed: %v\n", addr, err)
+				os.Exit(1)
+			}
+			uTxid, uVout, uValue = best.TxID, best.Vout, best.Value
+			fmt.Printf("using UTXO %s:%d (%d sats)\n", uTxid, uVout, uValue)
+		}
+		if uValue < *deposit+*fee {
+			fmt.Printf("error: UTXO value %d < deposit+fee %d\n", uValue, *deposit+*fee)
+			os.Exit(2)
+		}
+		tx := buildFunding(clientPriv, clientPub, serverPub, uTxid, uVout, uValue, *deposit, *fee)
 		emit("FUNDING", tx, *broadcast, *api)
 		fmt.Printf("=> use for settle: -funding-txid %s -funding-vout 0 -funding-value %d\n",
 			hex.EncodeToString(rev(tx.TxID())), *deposit)
@@ -194,6 +235,78 @@ func emit(label string, tx *bsvtx.Tx, broadcast bool, api string) {
 		os.Exit(1)
 	}
 	fmt.Printf("  BROADCAST OK -> %s\n", id)
+}
+
+type utxoRef struct {
+	TxID   string
+	Vout   uint32
+	Value  uint64
+	Height uint32
+}
+
+// fetchUTXOs lists the unspent outputs for an address (WhatsOnChain-style:
+// {base}/{addr}/unspent -> [{height,tx_pos,tx_hash,value}]).
+func fetchUTXOs(apiBase, addr string) ([]utxoRef, error) {
+	url := fmt.Sprintf("%s/%s/unspent", strings.TrimRight(apiBase, "/"), addr)
+	var raw []struct {
+		Height uint32 `json:"height"`
+		TxPos  uint32 `json:"tx_pos"`
+		TxHash string `json:"tx_hash"`
+		Value  uint64 `json:"value"`
+	}
+	if err := getJSON(url, &raw); err != nil {
+		return nil, err
+	}
+	out := make([]utxoRef, len(raw))
+	for i, r := range raw {
+		out[i] = utxoRef{TxID: r.TxHash, Vout: r.TxPos, Value: r.Value, Height: r.Height}
+	}
+	return out, nil
+}
+
+// pickUTXO returns the largest single unspent output that covers `need` sats.
+func pickUTXO(apiBase, addr string, need uint64) (utxoRef, error) {
+	us, err := fetchUTXOs(apiBase, addr)
+	if err != nil {
+		return utxoRef{}, err
+	}
+	var best utxoRef
+	for _, u := range us {
+		if u.Value >= need && u.Value > best.Value {
+			best = u
+		}
+	}
+	if best.TxID == "" {
+		return utxoRef{}, fmt.Errorf("no single UTXO >= %d sats among %d unspent", need, len(us))
+	}
+	return best, nil
+}
+
+// fetchStatus returns a tx's confirmations and block height (WhatsOnChain-style).
+func fetchStatus(apiBase, txid string) (confirmations, blockHeight int, err error) {
+	url := fmt.Sprintf("%s/%s", strings.TrimRight(apiBase, "/"), txid)
+	var raw struct {
+		Confirmations int `json:"confirmations"`
+		BlockHeight   int `json:"blockheight"`
+	}
+	if err := getJSON(url, &raw); err != nil {
+		return 0, 0, err
+	}
+	return raw.Confirmations, raw.BlockHeight, nil
+}
+
+func getJSON(url string, dst any) error {
+	cl := &http.Client{Timeout: 30 * time.Second}
+	resp, err := cl.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	return json.Unmarshal(b, dst)
 }
 
 func postRaw(api, txhex string) (string, error) {

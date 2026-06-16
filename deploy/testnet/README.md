@@ -10,21 +10,28 @@ Run on a machine with internet (the VM). `SEED` is any 32-byte hex you control.
 ```sh
 SEED=$(openssl rand -hex 32)
 
-# 1) Get the client's testnet address and fund it from a faucet (e.g. a BSV testnet faucet).
+# 1) Get the client's testnet address and fund it from a faucet.
 go run ./cmd/channeltestnet -client-seed $SEED -mode address
-#   -> client address: m...    (send testnet sats here; note the funding UTXO txid:vout:value)
+#   -> client address: m...
 
-# 2) After the faucet tx confirms, lock a deposit into the 2-of-2 funding output:
-go run ./cmd/channeltestnet -client-seed $SEED -mode fund \
-   -utxo-txid <faucet_txid> -utxo-vout <n> -utxo-value <sats> \
-   -deposit 50000 -fee 500 -broadcast
+# (optional) list the address's UTXOs once the faucet tx lands:
+go run ./cmd/channeltestnet -client-seed $SEED -mode utxo
+
+# 2) Lock a deposit into the 2-of-2 funding output. The funding UTXO is AUTO-DISCOVERED
+#    from the explorer (largest unspent covering deposit+fee); -utxo-* still override it:
+go run ./cmd/channeltestnet -client-seed $SEED -mode fund -deposit 50000 -fee 500 -broadcast
 #   -> FUNDING txid + "use for settle: -funding-txid <id> -funding-vout 0 -funding-value 50000"
 
-# 3) After the funding tx confirms, broadcast a SETTLEMENT (2-of-2 spend; pay the server,
-#    change to the client) and print the nLockTime REFUND:
+# (wait for confirmations) check it:
+go run ./cmd/channeltestnet -client-seed $SEED -mode status -txid <funding_txid>
+
+# 3) Broadcast a SETTLEMENT (2-of-2 spend; pay the server, change to the client) and print
+#    the nLockTime REFUND:
 go run ./cmd/channeltestnet -client-seed $SEED -mode settle \
    -funding-txid <funding_txid> -funding-vout 0 -funding-value 50000 \
    -pay 4000 -fee 500 -locktime 1600000 -broadcast
+
+go run ./cmd/channeltestnet -client-seed $SEED -mode status -txid <settlement_txid>
 ```
 
 Verify each txid on a testnet explorer (e.g. WhatsOnChain testnet). Notes:
